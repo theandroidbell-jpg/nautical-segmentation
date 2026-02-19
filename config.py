@@ -4,9 +4,20 @@ Configuration module for Nautical Chart Segmentation System.
 This module centralizes all configuration settings including database connections,
 file paths, model parameters, and class mappings. It supports environment variable
 overrides for sensitive values.
+
+REQUIRED environment variables:
+    DB_USER     - PostgreSQL username (e.g. svc_nautical_seg)
+    DB_PASSWORD - PostgreSQL password
+    
+Optional environment variables:
+    DB_HOST     - Database host (default: 192.168.11.6)
+    DB_PORT     - Database port (default: 5433)
+    DB_NAME     - Database name (default: mapping)
+    DB_SSLMODE  - SSL mode (default: prefer)
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List
 import psycopg2
@@ -23,8 +34,9 @@ class Config:
     DB_HOST: str = os.getenv('DB_HOST', '192.168.11.6')
     DB_PORT: int = int(os.getenv('DB_PORT', '5433'))
     DB_NAME: str = os.getenv('DB_NAME', 'mapping')
-    DB_USER: str = os.getenv('DB_USER', 'postgres')
-    DB_PASSWORD: str = os.getenv('DB_PASSWORD', 'xxx')
+    DB_USER: str = os.getenv('DB_USER', '')
+    DB_PASSWORD: str = os.getenv('DB_PASSWORD', '')
+    DB_SSLMODE: str = os.getenv('DB_SSLMODE', 'prefer')
     DB_SCHEMA: str = 'dev_rcxl'
     
     # ============================================================
@@ -109,52 +121,87 @@ class Config:
     ]
     
     @classmethod
-    def get_db_connection(cls):
+    def _check_db_credentials(cls):
+        """Validate that required database credentials are set via environment variables.
+        
+        Raises:
+            SystemExit: If DB_USER or DB_PASSWORD are not set
         """
-        Create and return a psycopg2 database connection.
+        missing = []
+        if not cls.DB_USER:
+            missing.append('DB_USER')
+        if not cls.DB_PASSWORD:
+            missing.append('DB_PASSWORD')
+        
+        if missing:
+            print(
+                f"\n{'='*60}\n"
+                f"ERROR: Missing required environment variables: {', '.join(missing)}\n"
+                f"\nPlease set them before running:\n"
+                f"  export DB_USER='svc_nautical_seg'\n"
+                f"  export DB_PASSWORD='your_password_here'\n"
+                f"\nOr add them to ~/.bashrc for persistence.\n"
+                f"{'='*60}\n",
+                file=sys.stderr
+            )
+            sys.exit(1)
+    
+    @classmethod
+    def get_db_connection(cls):
+        """Create and return a psycopg2 database connection.
         
         Returns:
             psycopg2.connection: Database connection object
             
         Raises:
             psycopg2.Error: If connection fails
+            SystemExit: If credentials not set
         """
+        cls._check_db_credentials()
         conn = psycopg2.connect(
             host=cls.DB_HOST,
             port=cls.DB_PORT,
             dbname=cls.DB_NAME,
             user=cls.DB_USER,
-            password=cls.DB_PASSWORD
+            password=cls.DB_PASSWORD,
+            sslmode=cls.DB_SSLMODE
         )
         return conn
     
     @classmethod
     def get_engine(cls) -> Engine:
-        """
-        Create and return a SQLAlchemy engine.
+        """Create and return a SQLAlchemy engine.
         
         Returns:
             Engine: SQLAlchemy engine for database operations
+            
+        Raises:
+            SystemExit: If credentials not set
         """
+        cls._check_db_credentials()
         connection_string = (
             f"postgresql://{cls.DB_USER}:{cls.DB_PASSWORD}@"
             f"{cls.DB_HOST}:{cls.DB_PORT}/{cls.DB_NAME}"
+            f"?sslmode={cls.DB_SSLMODE}"
         )
         engine = create_engine(connection_string)
         return engine
     
     @classmethod
     def get_connection_string(cls) -> str:
-        """
-        Get PostgreSQL connection string for command-line tools.
+        """Get PostgreSQL connection string for command-line tools.
         
         Returns:
             str: Connection string in format suitable for psql/ogr2ogr
+            
+        Raises:
+            SystemExit: If credentials not set
         """
+        cls._check_db_credentials()
         return (
             f"PG:host={cls.DB_HOST} port={cls.DB_PORT} "
             f"dbname={cls.DB_NAME} user={cls.DB_USER} "
-            f"password={cls.DB_PASSWORD}"
+            f"password={cls.DB_PASSWORD} sslmode={cls.DB_SSLMODE}"
         )
     
     @classmethod
@@ -172,8 +219,7 @@ class Config:
     
     @classmethod
     def get_origin_path(cls, origin: str) -> Path:
-        """
-        Get the path for a specific chart origin.
+        """Get the path for a specific chart origin.
         
         Args:
             origin: Chart origin ('ukho', 'shom', 'bsh')
@@ -183,7 +229,7 @@ class Config:
             
         Raises:
             ValueError: If origin is not recognized
-        """
+        """        
         origin_lower = origin.lower()
         if origin_lower == 'ukho':
             return cls.CHARTS_UKHO
