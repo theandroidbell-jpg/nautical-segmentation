@@ -6,11 +6,13 @@ registered charts by filename. Inserts complete coverage polygons (sea, land, ex
 into the database.
 
 Features:
-- Shapefile processing with flexible attribute field matching
+- Shapefile processing with full classification code mapping (20 codes)
+- Handles null/NaN codes (defaults to exclude)
+- Skips Ignore features (code -20)
 - GeoTIFF mask processing (alpha channel detection)
 - Automatic reprojection to EPSG:4326
 - Polygon dissolution by class type
-- Comprehensive logging
+- Comprehensive logging with code names
 """
 
 import argparse
@@ -109,6 +111,13 @@ def process_shapefile(shp_path: Path, conn, dry_run: bool = False) -> Tuple[bool
     """
     Process a ground truth shapefile.
     
+    Handles all classification codes:
+    - Code 20 (Sea) -> class 'sea'
+    - Codes 10, 17 (Land, Bridges) -> class 'land'
+    - All other codes (0-19 except above) -> class 'exclude'
+    - Code -20 (Ignore) -> skipped entirely
+    - Null/NaN codes -> class 'exclude'
+    
     Args:
         shp_path: Path to shapefile
         conn: Database connection
@@ -145,40 +154,85 @@ def process_shapefile(shp_path: Path, conn, dry_run: bool = False) -> Tuple[bool
             logger.error(f"Could not find code field in shapefile: {shp_path}")
             return False, chart_id
         
+        # Log unique codes found
+        unique_codes = gdf[code_field].unique()
+        logger.info(f"  Codes found: {sorted([c for c in unique_codes if c is not None and not (isinstance(c, float) and np.isnan(c))])}")
+        
+        # Handle null codes: fill NaN with a sentinel, then process
+        # We'll process nulls separately
+        null_mask = gdf[code_field].isna()
+        if null_mask.any():
+            logger.info(f"  Found {null_mask.sum()} features with null/empty code -> treating as exclude")
+        
         # Reproject to EPSG:4326 if needed
         if gdf.crs and gdf.crs.to_epsg() != 4326:
-            logger.info(f"Reprojecting from {gdf.crs} to EPSG:4326")
+            logger.info(f"  Reprojecting from {gdf.crs} to EPSG:4326")
             gdf = gdf.to_crs(epsg=4326)
         
-        # Group by code and create MultiPolygons
-        inserted_count = 0
+        # Collect geometries by ML class
+        class_geometries: Dict[str, list] = {
+            'sea': [],
+            'land': [],
+            'exclude': []
+        }
         
-        for code, group in gdf.groupby(code_field):
-            # Map code to class index
-            if code not in Config.SHAPEFILE_CODE_MAP:
-                logger.warning(f"Unknown code {code}, skipping")
+        skipped_count = 0
+        
+        for idx, row in gdf.iterrows():
+            code = row[code_field]
+            
+            # Use Config.map_shapefile_code() for proper mapping
+            class_idx = Config.map_shapefile_code(code)
+            
+            if class_idx is None:
+                # Skip this feature (e.g. code -20 Ignore)
+                code_name = Config.SHAPEFILE_CODE_NAMES.get(int(code), 'Unknown') if code is not None else 'null'
+                logger.debug(f"  Skipping feature with code {code} ({code_name})")
+                skipped_count += 1
                 continue
             
-            class_idx = Config.SHAPEFILE_CODE_MAP[code]
             class_type = Config.CLASS_MAP[class_idx]
+            geom = row.geometry
+            
+            if geom is not None and not geom.is_empty:
+                class_geometries[class_type].append(geom)
+        
+        if skipped_count > 0:
+            logger.info(f"  Skipped {skipped_count} Ignore features (code -20)")
+        
+        # Insert dissolved geometries by class
+        inserted_count = 0
+        
+        for class_type, geoms in class_geometries.items():
+            if not geoms:
+                continue
             
             # Dissolve geometries into single MultiPolygon
-            dissolved = unary_union(group.geometry)
+            dissolved = unary_union(geoms)
             
             # Convert to MultiPolygon if needed
             if dissolved.geom_type == 'Polygon':
                 multipolygon = MultiPolygon([dissolved])
             elif dissolved.geom_type == 'MultiPolygon':
                 multipolygon = dissolved
+            elif dissolved.geom_type == 'GeometryCollection':
+                # Extract only polygon types from collection
+                polys = [g for g in dissolved.geoms if g.geom_type in ('Polygon', 'MultiPolygon')]
+                if not polys:
+                    logger.warning(f"  No polygons in GeometryCollection for {class_type}")
+                    continue
+                multipolygon = MultiPolygon(polys) if len(polys) > 1 else (polys[0] if polys[0].geom_type == 'MultiPolygon' else MultiPolygon(polys))
             else:
-                logger.warning(f"Unexpected geometry type: {dissolved.geom_type}")
+                logger.warning(f"  Unexpected geometry type: {dissolved.geom_type}")
                 continue
             
             # Calculate pixel area (approximate)
             pixel_area = int(multipolygon.area * 1e10)  # Rough estimate
             
+            logger.info(f"  {class_type}: {len(geoms)} features dissolved into {len(multipolygon.geoms)} polygons")
+            
             if dry_run:
-                logger.info(f"[DRY RUN] Would insert {class_type} polygon for chart {chart_id}")
+                logger.info(f"  [DRY RUN] Would insert {class_type} polygon for chart {chart_id}")
                 inserted_count += 1
             else:
                 # Insert into database
@@ -197,10 +251,10 @@ def process_shapefile(shp_path: Path, conn, dry_run: bool = False) -> Tuple[bool
                             pixel_area
                         ))
                     conn.commit()
-                    logger.info(f"Inserted {class_type} polygon for chart {chart_id}")
+                    logger.info(f"  Inserted {class_type} polygon for chart {chart_id}")
                     inserted_count += 1
                 except Exception as e:
-                    logger.error(f"Failed to insert ground truth: {e}")
+                    logger.error(f"  Failed to insert ground truth: {e}")
                     conn.rollback()
         
         duration = time.time() - start_time
@@ -280,7 +334,6 @@ def process_geotiff_mask(tif_path: Path, conn, dry_run: bool = False) -> Tuple[b
                     
                     # Reproject to EPSG:4326 if needed
                     if crs and crs.to_epsg() != 4326:
-                        import geopandas as gpd
                         gdf_temp = gpd.GeoDataFrame({'geometry': [sea_multipolygon]}, crs=crs)
                         gdf_temp = gdf_temp.to_crs(epsg=4326)
                         sea_multipolygon = gdf_temp.geometry.iloc[0]
@@ -322,9 +375,8 @@ def process_geotiff_mask(tif_path: Path, conn, dry_run: bool = False) -> Tuple[b
                     
                     # Reproject to EPSG:4326 if needed
                     if crs and crs.to_epsg() != 4326:
-                        import geopandas as gpd
                         gdf_temp = gpd.GeoDataFrame({'geometry': [land_multipolygon]}, crs=crs)
-                        gdf_temp = gdf_temp.to_crs(epsg=4326)
+                        gdf_temp = g_temp.to_crs(epsg=4326)
                         land_multipolygon = gdf_temp.geometry.iloc[0]
                     
                     pixel_area = int(land_mask.sum())
@@ -422,6 +474,8 @@ def main():
     logger.info(f"Data directory: {args.data_dir}")
     logger.info(f"Source format: {args.source_format}")
     logger.info(f"Dry run: {args.dry_run}")
+    logger.info(f"Code mapping: {len(Config.SHAPEFILE_CODE_MAP)} codes -> 3 classes")
+    logger.info(f"Skip codes: {Config.SHAPEFILE_SKIP_CODES}")
     logger.info("=" * 60)
     
     # Connect to database
