@@ -19,7 +19,7 @@ Optional environment variables:
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import psycopg2
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -77,19 +77,11 @@ class Config:
     # ============================================================
     # Class Mapping
     # ============================================================
-    # Class index to name mapping for ML model
+    # ML model uses 3 classes: sea (0), land (1), exclude (2)
     CLASS_MAP: Dict[int, str] = {
         0: 'sea',
         1: 'land',
         2: 'exclude'
-    }
-    
-    # Shapefile code to class index mapping
-    # Shapefiles contain codes: 10=land, 20=sea, 13=exclude/panels
-    SHAPEFILE_CODE_MAP: Dict[int, int] = {
-        20: 0,  # sea
-        10: 1,  # land
-        13: 2   # exclude
     }
     
     # Reverse mapping: class name to index
@@ -97,6 +89,76 @@ class Config:
         'sea': 0,
         'land': 1,
         'exclude': 2
+    }
+    
+    # ============================================================
+    # Shapefile Code Mapping (Full Classification)
+    # ============================================================
+    # Maps every shapefile code to our 3-class ML model index.
+    # Code -20 (Ignore) is handled separately — skipped entirely.
+    #
+    # Code  Name             ML Class
+    # ----  ---------------  --------
+    #  20   Sea Areas        0 (sea)     — primary target
+    #  10   Land             1 (land)
+    #  17   Bridges          1 (land)    — physical structures
+    #   0   Extents          2 (exclude) — chart panel boundary
+    #   1   NoData           2 (exclude) — outside chart coverage
+    #   2   Crest            2 (exclude) — Admiralty crest
+    #   3   Panel            2 (exclude) — child panel in parent
+    #   5   UnCharted        2 (exclude) — uncharted areas
+    #  11   Info             2 (exclude) — title/info blocks
+    #  12   Source           2 (exclude) — source data diagrams
+    #  13   Scale Bars       2 (exclude) — scale bar areas
+    #  14   Tidal Atlas      2 (exclude) — tidal stream atlases
+    #  15   Tidal Diamonds   2 (exclude) — tidal diamond info
+    #  16   (unnamed)        2 (exclude) — unknown
+    #  18   UnWanted/Bad     2 (exclude) — insufficient data
+    #  19   UnSurveyed       2 (exclude) — unsurveyed areas
+    # -20   Ignore           SKIP        — marked for removal, skip entirely
+    # null  (unpopulated)    2 (exclude) — sea is always populated, so blank = not sea
+    
+    SHAPEFILE_CODE_MAP: Dict[int, int] = {
+        20: 0,   # Sea Areas → sea
+        10: 1,   # Land → land
+        17: 1,   # Bridges/Causeways → land
+        0:  2,   # Extents → exclude
+        1:  2,   # NoData → exclude
+        2:  2,   # Crest → exclude
+        3:  2,   # Panel → exclude
+        5:  2,   # UnCharted → exclude
+        11: 2,   # Info → exclude
+        12: 2,   # Source → exclude
+        13: 2,   # Scale Bars → exclude
+        14: 2,   # Tidal Atlas → exclude
+        15: 2,   # Tidal Diamonds → exclude
+        16: 2,   # (unnamed) → exclude
+        18: 2,   # UnWanted/Bad → exclude
+        19: 2,   # UnSurveyed → exclude
+    }
+    
+    # Codes to skip entirely during ingestion (not included in training)
+    SHAPEFILE_SKIP_CODES: List[int] = [-20]
+    
+    # Human-readable names for all shapefile codes (for logging)
+    SHAPEFILE_CODE_NAMES: Dict[int, str] = {
+        -20: 'Ignore',
+        0:   'Extents',
+        1:   'NoData',
+        2:   'Crest',
+        3:   'Panel',
+        5:   'UnCharted',
+        10:  'Land',
+        11:  'Info',
+        12:  'Source',
+        13:  'Scale Bars',
+        14:  'Tidal Atlas',
+        15:  'Tidal Diamonds',
+        16:  '(unnamed)',
+        17:  'Bridges',
+        18:  'UnWanted/Bad',
+        19:  'UnSurveyed',
+        20:  'Sea Areas',
     }
     
     # ============================================================
@@ -229,7 +291,7 @@ class Config:
             
         Raises:
             ValueError: If origin is not recognized
-        """        
+        """
         origin_lower = origin.lower()
         if origin_lower == 'ukho':
             return cls.CHARTS_UKHO
@@ -239,6 +301,35 @@ class Config:
             return cls.CHARTS_BSH
         else:
             raise ValueError(f"Unknown origin: {origin}")
+    
+    @classmethod
+    def map_shapefile_code(cls, code) -> Optional[int]:
+        """Map a shapefile code to ML class index, handling nulls and skips.
+        
+        Args:
+            code: Shapefile code value (int, float, None, or NaN)
+            
+        Returns:
+            ML class index (0=sea, 1=land, 2=exclude), or None if code should be skipped
+        """
+        # Handle null/NaN → exclude
+        if code is None:
+            return 2
+        try:
+            import numpy as np
+            if np.isnan(float(code)):
+                return 2
+        except (ValueError, TypeError):
+            return 2
+        
+        code_int = int(code)
+        
+        # Skip codes (e.g. -20 Ignore)
+        if code_int in cls.SHAPEFILE_SKIP_CODES:
+            return None
+        
+        # Look up in map; default unknown codes to exclude
+        return cls.SHAPEFILE_CODE_MAP.get(code_int, 2)
 
 
 # Convenience instance for direct import
