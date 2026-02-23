@@ -7,4 +7,4 @@ This module contains scripts for:
 - PyTorch dataset classes for model training
 """
 
-__all__ = ['create_masks', 'tile_dataset', 'dataset']
+__all__ = ['create_masks', 'tile_dataset', 'dataset', 'create_tiles', 'dataloader']
