@@ -326,9 +326,20 @@ def tile_chart(
             img_height, img_width = src_img.height, src_img.width
             img_profile = src_img.profile
 
-            # Read exactly 3 RGB bands
+            # Read available bands and convert to 3-band RGB
             n_bands = 3
-            img_data = src_img.read([1, 2, 3])  # (3, H, W) uint8
+            if src_img.count >= 3:
+                img_data = src_img.read([1, 2, 3])  # (3, H, W) uint8
+            elif src_img.count == 1:
+                logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
+                band = src_img.read(1)  # (H, W) uint8
+                img_data = np.stack([band, band, band])  # grayscale → 3-channel
+            else:
+                # 2-band case: duplicate first band for third channel
+                logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
+                b1 = src_img.read(1)
+                b2 = src_img.read(2)
+                img_data = np.stack([b1, b2, b1])
             mask_data = src_mask.read(1)         # (H, W) uint8
 
         # Iterate over grid positions
