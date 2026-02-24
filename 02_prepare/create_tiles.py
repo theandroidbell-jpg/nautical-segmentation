@@ -184,21 +184,20 @@ def register_tiles_in_db(
         count = 0
         with conn.cursor() as cur:
             for img_path, mask_path in tile_paths:
+                parts = img_path.stem.split('_')
+                if len(parts) < 3:
+                    logger.warning(f"Unexpected tile filename format: {img_path.name}; skipping")
+                    continue
+                tile_x = int(parts[1])
+                tile_y = int(parts[2])
                 cur.execute(
                     """
                     INSERT INTO dev_rcxl.tiles
-                    (chart_id, image_path, mask_path, usage, tile_size, overlap)
+                    (chart_id, tile_x, tile_y, tile_size, overlap, usage)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
-                    (
-                        chart_id,
-                        str(img_path),
-                        str(mask_path),
-                        usage,
-                        tile_size,
-                        overlap,
-                    ),
+                    (chart_id, tile_x, tile_y, tile_size, overlap, usage),
                 )
                 count += cur.rowcount
         conn.commit()
