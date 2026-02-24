@@ -171,7 +171,7 @@ The model predicts 3 classes:
 
 Ground truth must provide **complete coverage** - every pixel classified as one of the three classes.
 
-## Usage (Sprint 1)
+## Usage (Sprints 1 & 2)
 
 ### 1. Ingest Charts
 
@@ -226,9 +226,75 @@ Masks are saved to `/data/output/masks/` as single-band uint8 GeoTIFFs with:
 - Value 1: Land
 - Value 2: Exclude
 
+### 4. Create Tiles
+
+Slice each chart and its mask into 256×256 pixel tiles with 32px overlap. Tiles are
+written to `train/` and `val/` subdirectories using a reproducible 80/20 chart-level
+split (all tiles from a chart stay in one split):
+
+```bash
+# Tile all charts that have a mask (recommended first run)
+python 02_prepare/create_tiles.py --all --overwrite --verbose
+
+# Tile a single chart
+python 02_prepare/create_tiles.py --chart-id 42 --overwrite --verbose
+
+# Dry run – count tiles without writing files
+python 02_prepare/create_tiles.py --all --dry-run --verbose
+```
+
+Tiles are written to `/data/output/tiles/` in the following layout:
+```
+/data/output/tiles/
+  train/{chart_id}_{col}_{row}.tif        # 3-band RGB image tile
+  train/{chart_id}_{col}_{row}_mask.tif   # single-band class mask (0/1/2)
+  val/{chart_id}_{col}_{row}.tif
+  val/{chart_id}_{col}_{row}_mask.tif
+```
+
+Tile metadata (chart_id, tile_x, tile_y, usage) is registered in
+`dev_rcxl.tiles` so you can query the split at any time.
+
+### 5. Verify Data Pipeline
+
+Once tiles exist, run the DataLoader smoke-test to confirm the PyTorch data
+pipeline is working end-to-end:
+
+```bash
+python 02_prepare/dataloader.py
+```
+
+Expected output:
+```
+Tile base directory: /data/output/tiles
+Train dataset size : <N>
+Val dataset size   : <M>
+Loading one training batch … OK  images=(8, 3, 256, 256), masks=(8, 256, 256)
+Loading one validation batch … OK  images=(8, 3, 256, 256), masks=(8, 256, 256)
+Smoke-test passed ✓
+```
+
+The `NauticalTileDataset` class (in `02_prepare/dataset.py`) can also be used
+directly in custom training scripts:
+
+```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/path/to/nautical-segmentation/02_prepare')
+from dataset import NauticalTileDataset
+from dataloader import get_dataloaders
+
+train_loader, val_loader = get_dataloaders(Path('/data/output/tiles'))
+for images, masks in train_loader:
+    # images: (B, 3, 256, 256) float32 in [0, 1]
+    # masks:  (B, 256, 256)    int64  (0=sea, 1=land, 2=exclude)
+    ...
+```
+
 ## Sprint Roadmap
 
-### ✅ Sprint 1 (Current)
+### ✅ Sprint 1 (Complete)
 - [x] Project structure and configuration
 - [x] PostGIS schema design
 - [x] Chart ingestion from TIF files
@@ -236,11 +302,11 @@ Masks are saved to `/data/output/masks/` as single-band uint8 GeoTIFFs with:
 - [x] Raster mask creation
 - [x] Database setup utilities
 
-### 🔄 Sprint 2 (Upcoming)
-- [ ] Tile dataset creation (256×256 patches with 32px overlap)
-- [ ] Train/validation split
-- [ ] PyTorch Dataset class
-- [ ] Data loading pipeline
+### ✅ Sprint 2 (Complete)
+- [x] Tile dataset creation (256×256 patches with 32px overlap)
+- [x] Train/validation split (chart-level, 80/20, reproducible seed)
+- [x] PyTorch Dataset class (`NauticalTileDataset` in `02_prepare/dataset.py`)
+- [x] Data loading pipeline (`get_dataloaders` in `02_prepare/dataloader.py`)
 
 ### 🔄 Sprint 3 (Upcoming)
 - [ ] U-Net + MobileNetV2 architecture
