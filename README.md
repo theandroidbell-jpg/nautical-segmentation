@@ -171,7 +171,93 @@ The model predicts 3 classes:
 
 Ground truth must provide **complete coverage** - every pixel classified as one of the three classes.
 
-## Usage (Sprint 1)
+## Training (Sprint 3)
+
+### Quick CPU smoke run
+
+```bash
+python 03_train/train.py --max-batches 2 --epochs 1 --no-pretrained
+```
+
+### Full training (CPU)
+
+```bash
+python 03_train/train.py \
+  --epochs 50 \
+  --batch-size 8 \
+  --lr 1e-4 \
+  --checkpoint-dir /data/output/checkpoints \
+  --tile-dir /data/output/tiles \
+  --num-workers 0 \
+  --patience 10
+```
+
+All CLI flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--epochs` | 50 | Max training epochs |
+| `--batch-size` | 8 | Mini-batch size |
+| `--lr` | 1e-4 | Adam learning rate |
+| `--device` | `cpu` | `cpu` or `cuda` |
+| `--checkpoint-dir` | `/data/output/checkpoints` | Where to save the best model |
+| `--tile-dir` | `/data/output/tiles` | Root tile directory |
+| `--num-workers` | 0 | DataLoader workers (0 = stable on CPU) |
+| `--max-batches` | None | Cap batches/epoch for smoke testing |
+| `--patience` | 10 | Early-stopping patience (epochs) |
+| `--seed` | 42 | Random seed |
+| `--no-pretrained` | — | Disable pretrained MobileNetV2 weights |
+| `--loss` | `combined` | `combined`, `dice`, or `ce` |
+| `--num-classes` | 3 | Number of segmentation classes |
+
+### CPU Limitations
+
+Running on a CPU-only server is fully supported but is significantly slower than GPU training:
+
+- **Throughput**: Expect ≈ 0.5–2 tiles/second on a modern CPU versus 50–200 tiles/second on a GPU.
+- **Batch size**: Keep `--batch-size` at 4–8 on CPU to avoid excessive memory pressure.
+- **Workers**: Use `--num-workers 0` on CPU-only servers to avoid multiprocessing overhead and stability issues with some GDAL/rasterio builds.
+- **Mixed precision**: `torch.cuda.amp` is not available on CPU; training uses full float32.
+- **Epoch time**: With ~10 000 training tiles at batch size 8, expect 60–120 minutes per epoch on CPU.
+
+### Moving to a GPU Machine
+
+When a CUDA-capable GPU is available:
+
+1. Install the CUDA build of PyTorch (replace the CPU-only wheel):
+   ```bash
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   ```
+
+2. Run training with `--device cuda`:
+   ```bash
+   python 03_train/train.py \
+     --device cuda \
+     --batch-size 32 \
+     --num-workers 4 \
+     --epochs 50
+   ```
+
+3. Enable mixed-precision training (add to `train_epoch` / `validate_epoch`):
+   ```python
+   from torch.cuda.amp import autocast, GradScaler
+   scaler = GradScaler()
+   with autocast():
+       logits = model(images)
+       loss = criterion(logits, masks)
+   scaler.scale(loss).backward()
+   scaler.step(optimizer)
+   scaler.update()
+   ```
+
+4. Use `pin_memory=True` (already set in `get_dataloaders`) and increase `--num-workers` to 4–8 for faster data loading.
+
+Expected GPU improvements over CPU:
+- **Training throughput**: ~50–100× faster per epoch.
+- **Larger batches**: batch size 32–64 feasible on a 16 GB GPU.
+- **Mixed precision**: ~1.5–2× additional speedup with AMP.
+
+
 
 ### 1. Ingest Charts
 
@@ -228,7 +314,7 @@ Masks are saved to `/data/output/masks/` as single-band uint8 GeoTIFFs with:
 
 ## Sprint Roadmap
 
-### ✅ Sprint 1 (Current)
+### ✅ Sprint 1 (Complete)
 - [x] Project structure and configuration
 - [x] PostGIS schema design
 - [x] Chart ingestion from TIF files
@@ -236,18 +322,19 @@ Masks are saved to `/data/output/masks/` as single-band uint8 GeoTIFFs with:
 - [x] Raster mask creation
 - [x] Database setup utilities
 
-### 🔄 Sprint 2 (Upcoming)
-- [ ] Tile dataset creation (256×256 patches with 32px overlap)
-- [ ] Train/validation split
-- [ ] PyTorch Dataset class
-- [ ] Data loading pipeline
+### ✅ Sprint 2 (Complete)
+- [x] Tile dataset creation (256×256 patches with 32px overlap)
+- [x] Train/validation split
+- [x] PyTorch Dataset class (`NauticalTileDataset`)
+- [x] DataLoader factory (`get_dataloaders`)
 
-### 🔄 Sprint 3 (Upcoming)
-- [ ] U-Net + MobileNetV2 architecture
-- [ ] Training loop with validation
-- [ ] Data augmentation (flips, rotations, brightness/contrast)
-- [ ] Combined Dice + CrossEntropy loss
-- [ ] Model checkpointing and metrics tracking
+### ✅ Sprint 3 (Complete)
+- [x] U-Net + MobileNetV2 architecture (`03_train/model.py`)
+- [x] Training loop with validation and early stopping (`03_train/train.py`)
+- [x] Data augmentation — flips, 90° rotations, brightness/contrast (`03_train/augment.py`)
+- [x] Combined Dice + CrossEntropy loss (`03_train/losses.py`)
+- [x] Model checkpointing (best-by-val-mIoU) and metrics tracking
+- [x] CLI training entry point (`python 03_train/train.py --help`)
 
 ### 🔄 Sprint 4 (Upcoming)
 - [ ] Inference on new charts
