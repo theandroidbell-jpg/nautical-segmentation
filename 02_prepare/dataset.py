@@ -1,12 +1,13 @@
+# -*- coding: utf-8 -*-
 """
 PyTorch Dataset Module
 
 Provides NauticalTileDataset, a torch.utils.data.Dataset that loads pre-tiled
-256×256 chart image patches and their corresponding mask patches on-the-fly.
+256x256 chart image patches and their corresponding mask patches on-the-fly.
 
 Each tile directory is expected to contain pairs of files:
-  {stem}.tif        — 3-band RGB image tile (uint8)
-  {stem}_mask.tif   — single-band class mask tile (uint8, values 0/1/2)
+  {stem}.tif        -- 3-band RGB image tile (uint8)
+  {stem}_mask.tif   -- single-band class mask tile (uint8, values 0/1/2)
 
 Images are normalised to float32 [0, 1]; masks are cast to int64.
 """
@@ -37,6 +38,11 @@ class NauticalTileDataset(Dataset):
             ``(3, H, W)`` float32 and must return a tensor of the same shape.
         target_transform: Optional callable applied to the mask tensor.
             Receives a ``torch.Tensor`` of shape ``(H, W)`` int64.
+        joint_transform: Optional callable applied to BOTH the image and mask
+            tensors (after tensor conversion, before individual transforms).
+            Signature: ``(image: Tensor, mask: Tensor) -> (Tensor, Tensor)``.
+            Use this for augmentations that must be applied identically to
+            both image and mask (e.g. ``from augment import SegmentationAugmentation``).
 
     Raises:
         FileNotFoundError: If *tile_dir* does not exist.
@@ -56,6 +62,7 @@ class NauticalTileDataset(Dataset):
         tile_dir: Path,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
+        joint_transform: Optional[Callable] = None,
     ) -> None:
         tile_dir = Path(tile_dir)
         if not tile_dir.exists():
@@ -64,6 +71,7 @@ class NauticalTileDataset(Dataset):
         self.tile_dir = tile_dir
         self.transform = transform
         self.target_transform = target_transform
+        self.joint_transform = joint_transform
 
         # Discover image tiles (exclude mask files)
         all_tifs: List[Path] = sorted(tile_dir.glob('*.tif'))
@@ -115,6 +123,9 @@ class NauticalTileDataset(Dataset):
 
         image = torch.from_numpy(img_np)   # (3, H, W) float32
         mask = torch.from_numpy(mask_np)   # (H, W)    int64
+
+        if self.joint_transform is not None:
+            image, mask = self.joint_transform(image, mask)
 
         if self.transform is not None:
             image = self.transform(image)

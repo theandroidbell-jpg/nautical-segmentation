@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 DataLoader Factory Module
 
@@ -16,7 +17,7 @@ Usage::
 
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -30,6 +31,7 @@ def get_dataloaders(
     tile_base: Path,
     batch_size: int = Config.BATCH_SIZE,
     num_workers: int = 4,
+    train_transform: Optional[Callable] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders.
 
@@ -38,13 +40,16 @@ def get_dataloaders(
             subdirectories produced by *create_tiles.py*.
         batch_size: Number of samples per batch (default: Config.BATCH_SIZE = 8).
         num_workers: Parallel data-loading workers (default: 4).
+        train_transform: Optional joint transform applied to both image and mask
+            during training only.  Passed as ``joint_transform`` to the training
+            NauticalTileDataset.  Not applied to the validation dataset.
 
     Returns:
         Tuple ``(train_loader, val_loader)`` where:
 
         * ``train_loader`` shuffles samples on every epoch.
         * ``val_loader``   preserves order (no shuffle).
-        * Both use ``pin_memory=True`` for efficient CPU→GPU transfer.
+        * Both use ``pin_memory=True`` for efficient CPU->GPU transfer.
 
     Raises:
         FileNotFoundError: If ``tile_base/train`` or ``tile_base/val`` does
@@ -52,7 +57,7 @@ def get_dataloaders(
     """
     tile_base = Path(tile_base)
 
-    train_dataset = NauticalTileDataset(tile_base / 'train')
+    train_dataset = NauticalTileDataset(tile_base / 'train', joint_transform=train_transform)
     val_dataset = NauticalTileDataset(tile_base / 'val')
 
     train_loader = DataLoader(
@@ -86,15 +91,15 @@ def main() -> None:
     print(f"Train dataset size : {len(train_loader.dataset)}")
     print(f"Val dataset size   : {len(val_loader.dataset)}")
 
-    print("Loading one training batch …", end=' ', flush=True)
+    print("Loading one training batch ...", end=' ', flush=True)
     images, masks = next(iter(train_loader))
     print(f"OK  images={tuple(images.shape)}, masks={tuple(masks.shape)}")
 
-    print("Loading one validation batch …", end=' ', flush=True)
+    print("Loading one validation batch ...", end=' ', flush=True)
     images, masks = next(iter(val_loader))
     print(f"OK  images={tuple(images.shape)}, masks={tuple(masks.shape)}")
 
-    print("Smoke-test passed ✓")
+    print("Smoke-test passed [OK]")
 
 
 if __name__ == '__main__':

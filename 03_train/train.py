@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Training Loop
 
@@ -33,9 +34,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Metrics helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def calculate_iou(
     predictions: torch.Tensor,
@@ -66,15 +67,15 @@ def calculate_iou(
         union = (pred_mask | true_mask).sum().item()
 
         if union == 0:
-            continue  # class absent from both — skip
+            continue  # class absent from both - skip
         iou_dict[cls] = intersection / union
 
     return iou_dict
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Single-epoch helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def train_epoch(
     model: nn.Module,
@@ -210,9 +211,9 @@ def validate_epoch(
     return {'loss': avg_loss, 'pixel_acc': pixel_acc, 'mean_iou': mean_iou}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Main training orchestration
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def train_model(
     model: nn.Module,
@@ -294,7 +295,7 @@ def train_model(
                     'val_metrics': val_metrics,
                 },
             )
-            logger.info('  ✓ Saved best checkpoint (val mIoU=%.4f)', best_val_miou)
+            logger.info('  [OK] Saved best checkpoint (val mIoU=%.4f)', best_val_miou)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
@@ -306,9 +307,9 @@ def train_model(
     return {'best_val_miou': best_val_miou, 'best_epoch': best_epoch}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 def main():
     """Command-line entry point for training."""
@@ -320,7 +321,7 @@ def main():
                         help='Maximum training epochs.')
     parser.add_argument('--batch-size',    type=int,   default=Config.BATCH_SIZE,
                         help='Mini-batch size.')
-    parser.add_argument('--lr',            type=float, default=Config.LEARNING_RATE,
+    parser.add_argument('--lr',            type=float, default=5e-5,
                         help='Initial learning rate (Adam).')
     parser.add_argument('--device',        type=str,   default='cpu',
                         help="Training device: 'cpu' or 'cuda'.")
@@ -344,17 +345,25 @@ def main():
     parser.add_argument('--loss',          type=str,   default='combined',
                         choices=['combined', 'dice', 'ce'],
                         help='Loss function type.')
+    parser.add_argument('--class-weights', type=str,   default='1.0,5.6,3.9',
+                        help='Comma-separated per-class loss weights for num-classes classes '
+                             '(sea, land, exclude), e.g. 1.0,5.6,3.9.  Must provide exactly '
+                             'num-classes values.')
+    parser.add_argument('--no-augment',   action='store_true',
+                        help='Disable training data augmentation.')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
+                        help='Weight decay (L2 regularisation) for Adam optimiser.')
 
     args = parser.parse_args()
 
-    # ── Reproducibility ────────────────────────────────────────────────────
+    # -- Reproducibility -------------------------------------------------------
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ── Pretty-print settings ──────────────────────────────────────────────
+    # -- Pretty-print settings -------------------------------------------------
     logger.info('=' * 60)
-    logger.info('  Nautical Segmentation – Training (Sprint 3)')
+    logger.info('  Nautical Segmentation -- Training (Sprint 3)')
     logger.info('=' * 60)
     logger.info('  device        : %s', args.device)
     logger.info('  epochs        : %d', args.epochs)
@@ -370,19 +379,31 @@ def main():
     logger.info('  checkpoint-dir: %s', args.checkpoint_dir)
     logger.info('=' * 60)
 
-    # ── Data ───────────────────────────────────────────────────────────────
+    # -- Data ------------------------------------------------------------------
     sys.path.insert(0, str(Path(__file__).parent.parent / '02_prepare'))
     from dataloader import get_dataloaders
+    from augment import SegmentationAugmentation
+
+    train_transform = None
+    if not args.no_augment:
+        train_transform = SegmentationAugmentation(
+            horizontal_flip=True,
+            vertical_flip=True,
+            rotation_degrees=90,
+            brightness_range=(0.85, 1.15),
+            contrast_range=(0.85, 1.15),
+        )
 
     train_loader, val_loader = get_dataloaders(
         tile_base=args.tile_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        train_transform=train_transform,
     )
     logger.info('Train tiles: %d  |  Val tiles: %d',
                 len(train_loader.dataset), len(val_loader.dataset))
 
-    # ── Model ─────────────────────────────────────────────────────────────
+    # -- Model -----------------------------------------------------------------
     from model import create_model
     model = create_model(
         num_classes=args.num_classes,
@@ -393,12 +414,30 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info('Model params: %d total, %d trainable', total_params, trainable_params)
 
-    # ── Loss & optimiser ──────────────────────────────────────────────────
+    # -- Loss & optimiser ------------------------------------------------------
     from losses import get_loss_function
-    criterion = get_loss_function(loss_type=args.loss, num_classes=args.num_classes)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    try:
+        raw_weights = [float(w) for w in args.class_weights.split(',')]
+    except ValueError as exc:
+        parser.error(f'--class-weights must be comma-separated floats: {exc}')
+    if len(raw_weights) != args.num_classes:
+        parser.error(
+            f'--class-weights expects exactly {args.num_classes} values '
+            f'(got {len(raw_weights)}): {args.class_weights}'
+        )
+    class_weights = torch.tensor(raw_weights).to(args.device)
+    criterion = get_loss_function(
+        loss_type=args.loss,
+        num_classes=args.num_classes,
+        class_weights=class_weights,
+    )
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    # ── Train ─────────────────────────────────────────────────────────────
+    # -- Train -----------------------------------------------------------------
     result = train_model(
         model=model,
         train_loader=train_loader,
