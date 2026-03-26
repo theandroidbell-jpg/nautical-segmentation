@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio
+import rasterio.enums
 from rasterio.transform import from_origin
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -238,6 +239,30 @@ def split_charts(
 # Tiling
 # ---------------------------------------------------------------------------
 
+def _palette_to_rgb(src_img: rasterio.DatasetReader, band1: np.ndarray) -> np.ndarray:
+    """Convert a paletted (indexed-colour) band to a 3-channel RGB array.
+
+    Args:
+        src_img: Open rasterio dataset with a palette on band 1.
+        band1: 2-D uint8 array of palette indices with shape (H, W).
+
+    Returns:
+        np.ndarray of shape (3, H, W) and dtype uint8 containing true RGB values.
+    """
+    colormap = src_img.colormap(1)
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for idx, rgba in colormap.items():
+        if 0 <= idx <= 255:
+            if len(rgba) >= 4:
+                lut[idx] = rgba[:4]
+            elif len(rgba) == 3:
+                lut[idx] = (*rgba, 255)
+            # entries with fewer than 3 elements are left as (0, 0, 0, 0)
+    indices = band1.astype(np.uint8)
+    rgb = lut[indices, :3]  # (H, W, 3)
+    return np.moveaxis(rgb, -1, 0)  # (3, H, W)
+
+
 def _save_tile(
     data: np.ndarray,
     output_path: Path,
@@ -332,7 +357,11 @@ def tile_chart(
             elif src_img.count == 1:
                 logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
                 band = src_img.read(1)  # (H, W) uint8
-                img_data = np.stack([band, band, band])  # grayscale → 3-channel
+                if src_img.colorinterp[0] == rasterio.enums.ColorInterp.palette:
+                    logger.debug(f"Chart {chart_id}: paletted image detected, expanding colormap to RGB")
+                    img_data = _palette_to_rgb(src_img, band)
+                else:
+                    img_data = np.stack([band, band, band])  # grayscale → 3-channel
             else:
                 # 2-band case: duplicate first band for third channel
                 logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
