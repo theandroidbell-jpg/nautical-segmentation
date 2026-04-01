@@ -8,7 +8,7 @@ overrides for sensitive values.
 REQUIRED environment variables:
     DB_USER     - PostgreSQL username (e.g. svc_nautical_seg)
     DB_PASSWORD - PostgreSQL password
-    
+
 Optional environment variables:
     DB_HOST     - Database host (default: 192.168.11.6)
     DB_PORT     - Database port (default: 5433)
@@ -27,7 +27,7 @@ from sqlalchemy.engine import Engine
 
 class Config:
     """Central configuration for the nautical segmentation pipeline."""
-    
+
     # ============================================================
     # Database Configuration
     # ============================================================
@@ -38,7 +38,7 @@ class Config:
     DB_PASSWORD: str = os.getenv('DB_PASSWORD', '')
     DB_SSLMODE: str = os.getenv('DB_SSLMODE', 'prefer')
     DB_SCHEMA: str = 'dev_rcxl'
-    
+
     # ============================================================
     # Data Paths
     # ============================================================
@@ -47,77 +47,151 @@ class Config:
     CHARTS_UKHO: Path = CHARTS_ORIGINALS_BASE / 'ukho'
     CHARTS_SHOM: Path = CHARTS_ORIGINALS_BASE / 'shom'
     CHARTS_BSH: Path = CHARTS_ORIGINALS_BASE / 'bsh'
-    
-    # Ground truth data
+
+    # Preprocessed charts (palette→RGB converted, CRS-normalised)
+    CHARTS_PREPROCESSED_BASE: Path = Path('/data/charts/preprocessed')
+
+    # Shapefiles from the existing classification tool (one per chart/panel)
+    INITIAL_SHP_BASE: Path = Path('/data/charts/initial_shp')
+
+    # Human-corrected shapefiles (training only)
+    CORRECTED_SHP_BASE: Path = Path('/data/charts/corrected_shp')
+
+    # Human-corrected result TIFs (training only, optional reference)
+    CORRECTED_TIF_BASE: Path = Path('/data/charts/corrected_tif')
+
+    # Legacy ground truth paths (kept for backward compatibility)
     GROUND_TRUTH_BASE: Path = Path('/data/charts/ground_truth')
     GROUND_TRUTH_SHAPEFILES: Path = GROUND_TRUTH_BASE / 'shp'
     GROUND_TRUTH_GEOTIFFS: Path = GROUND_TRUTH_BASE / 'tif'
-    
+
     # Output paths
     OUTPUT_BASE: Path = Path('/data/output')
     OUTPUT_MASKS: Path = OUTPUT_BASE / 'masks'
+    OUTPUT_INITIAL_MASKS: Path = OUTPUT_BASE / 'initial_masks'
+    OUTPUT_CORRECTED_MASKS: Path = OUTPUT_BASE / 'corrected_masks'
+    OUTPUT_DIFF_MASKS: Path = OUTPUT_BASE / 'diff_masks'
     OUTPUT_TRANSPARENT_SOURCE: Path = OUTPUT_BASE / 'transparent_source'
     OUTPUT_TRANSPARENT_3857: Path = OUTPUT_BASE / 'transparent_3857'
     OUTPUT_TRANSPARENT_3395: Path = OUTPUT_BASE / 'transparent_3395'
     OUTPUT_TILES: Path = OUTPUT_BASE / 'tiles'
-    
+    OUTPUT_PREDICTIONS: Path = OUTPUT_BASE / 'predictions'
+    OUTPUT_VECTORS: Path = OUTPUT_BASE / 'vectors'
+
     # Model storage
     MODELS_DIR: Path = Path(__file__).parent / 'models'
-    
+
     # ============================================================
     # Model Parameters
     # ============================================================
     TILE_SIZE: int = 256
     OVERLAP: int = 32
     BATCH_SIZE: int = 8
-    NUM_CLASSES: int = 3
+    # 17 native classes: -1 and 0-20 (code -20 is skipped entirely)
+    NUM_CLASSES: int = 17
+    # 4 input channels: 3 RGB + 1 rasterised initial-shapefile classification
+    IN_CHANNELS: int = 4
     LEARNING_RATE: float = 1e-4
     EPOCHS: int = 50
-    
+
+    # Minimum overlap fraction required between reprojected shapefile and chart TIF
+    CRS_COVERAGE_MIN_FRACTION: float = 0.95
+
     # ============================================================
-    # Class Mapping
+    # Native Classification Codes
     # ============================================================
-    # ML model uses 3 classes: sea (0), land (1), exclude (2)
-    CLASS_MAP: Dict[int, str] = {
-        0: 'sea',
-        1: 'land',
-        2: 'exclude'
-    }
-    
-    # Reverse mapping: class name to index
-    CLASS_NAME_TO_INDEX: Dict[str, int] = {
-        'sea': 0,
-        'land': 1,
-        'exclude': 2
-    }
-    
-    # ============================================================
-    # Shapefile Code Mapping (Full Classification)
-    # ============================================================
-    # Maps every shapefile code to our 3-class ML model index.
-    # Code -20 (Ignore) is handled separately — skipped entirely.
+    # These are the codes used by the existing tool and in both the initial
+    # and corrected shapefiles.  Do NOT invent new codes.
     #
-    # Code  Name             ML Class
-    # ----  ---------------  --------
-    #  20   Sea Areas        0 (sea)     — primary target
-    #  10   Land             1 (land)
-    #  17   Bridges          1 (land)    — physical structures
-    #   0   Extents          2 (exclude) — chart panel boundary
-    #   1   NoData           2 (exclude) — outside chart coverage
-    #   2   Crest            2 (exclude) — Admiralty crest
-    #   3   Panel            2 (exclude) — child panel in parent
-    #   5   UnCharted        2 (exclude) — uncharted areas
-    #  11   Info             2 (exclude) — title/info blocks
-    #  12   Source           2 (exclude) — source data diagrams
-    #  13   Scale Bars       2 (exclude) — scale bar areas
-    #  14   Tidal Atlas      2 (exclude) — tidal stream atlases
-    #  15   Tidal Diamonds   2 (exclude) — tidal diamond info
-    #  16   (unnamed)        2 (exclude) — unknown
-    #  18   UnWanted/Bad     2 (exclude) — insufficient data
-    #  19   UnSurveyed       2 (exclude) — unsurveyed areas
-    # -20   Ignore           SKIP        — marked for removal, skip entirely
-    # null  (unpopulated)    2 (exclude) — sea is always populated, so blank = not sea
-    
+    # Value  Name            Description
+    # -----  --------------  -----------------------------------------------
+    # -20    Ignore          Feature/Light easily removed; skipped entirely
+    #  -1    Not Sure        Uncertain classification
+    #   0    Extents         Chart-Panel coverage
+    #   1    NoData          Areas outside chart coverage
+    #   2    Crest           Admiralty Crest area
+    #   3    Panel           Child Panel embedded in Parent
+    #   5    UnCharted       Uncharted areas (distinct from 18)
+    #  10    Land            Land area
+    #  11    Info            Titles and Information Blocks
+    #  12    Source          Source Data Diagrams
+    #  13    Scale Bars      Scale Bar areas
+    #  14    Tidal Atlas     Tidal Stream Atlases
+    #  15    Tidal Diamonds  Tidal Diamond Information Blocks
+    #  16    (reserved)      Currently unused
+    #  17    Bridges         Bridges and Causeways
+    #  18    UnWanted/Bad    Insufficient/inappropriate data
+    #  19    UnSurveyed      Unsurveyed areas
+    #  20    Sea Areas       Areas wanted in final clipped product
+
+    SHAPEFILE_CODE_NAMES: Dict[int, str] = {
+        -20: 'Ignore',
+        -1:  'Not Sure',
+        0:   'Extents',
+        1:   'NoData',
+        2:   'Crest',
+        3:   'Panel',
+        5:   'UnCharted',
+        10:  'Land',
+        11:  'Info',
+        12:  'Source',
+        13:  'Scale Bars',
+        14:  'Tidal Atlas',
+        15:  'Tidal Diamonds',
+        16:  '(reserved)',
+        17:  'Bridges',
+        18:  'UnWanted/Bad',
+        19:  'UnSurveyed',
+        20:  'Sea Areas',
+    }
+
+    # Codes to skip entirely (not included in training or inference)
+    SHAPEFILE_SKIP_CODES: List[int] = [-20]
+
+    # ============================================================
+    # Native Code ↔ Contiguous Class-Index Mapping
+    # ============================================================
+    # The neural network requires contiguous integer class indices starting
+    # at 0.  These mappings convert between native codes and model indices.
+    # Code -20 (Ignore) is excluded; all other codes get a unique index.
+    #
+    # Native code  →  class index
+    NATIVE_CODE_TO_CLASS_INDEX: Dict[int, int] = {
+        -1: 0,   # Not Sure
+        0:  1,   # Extents
+        1:  2,   # NoData
+        2:  3,   # Crest
+        3:  4,   # Panel
+        5:  5,   # UnCharted
+        10: 6,   # Land
+        11: 7,   # Info
+        12: 8,   # Source
+        13: 9,   # Scale Bars
+        14: 10,  # Tidal Atlas
+        15: 11,  # Tidal Diamonds
+        16: 12,  # (reserved)
+        17: 13,  # Bridges
+        18: 14,  # UnWanted/Bad
+        19: 15,  # UnSurveyed
+        20: 16,  # Sea Areas
+    }
+
+    # Class index  →  native code (reverse mapping)
+    CLASS_INDEX_TO_NATIVE_CODE: Dict[int, int] = {
+        v: k for k, v in NATIVE_CODE_TO_CLASS_INDEX.items()
+    }
+
+    # ── Convenience aliases ──────────────────────────────────────
+    # Class index for the Sea Areas code (used frequently)
+    SEA_CLASS_INDEX: int = 16    # native code 20
+    # Class index for Land (used for transparency masking)
+    LAND_CLASS_INDEX: int = 6    # native code 10
+
+    # ============================================================
+    # Legacy 3-class Shapefile Code Map (kept for backward compat)
+    # ============================================================
+    # Maps native codes to the old 3-class scheme: 0=sea, 1=land, 2=exclude.
+    # New code should use NATIVE_CODE_TO_CLASS_INDEX instead.
     SHAPEFILE_CODE_MAP: Dict[int, int] = {
         20: 0,   # Sea Areas → sea
         10: 1,   # Land → land
@@ -132,60 +206,45 @@ class Config:
         13: 2,   # Scale Bars → exclude
         14: 2,   # Tidal Atlas → exclude
         15: 2,   # Tidal Diamonds → exclude
-        16: 2,   # (unnamed) → exclude
+        16: 2,   # (reserved) → exclude
         18: 2,   # UnWanted/Bad → exclude
         19: 2,   # UnSurveyed → exclude
     }
-    
-    # Codes to skip entirely during ingestion (not included in training)
-    SHAPEFILE_SKIP_CODES: List[int] = [-20]
-    
-    # Human-readable names for all shapefile codes (for logging)
-    SHAPEFILE_CODE_NAMES: Dict[int, str] = {
-        -20: 'Ignore',
-        0:   'Extents',
-        1:   'NoData',
-        2:   'Crest',
-        3:   'Panel',
-        5:   'UnCharted',
-        10:  'Land',
-        11:  'Info',
-        12:  'Source',
-        13:  'Scale Bars',
-        14:  'Tidal Atlas',
-        15:  'Tidal Diamonds',
-        16:  '(unnamed)',
-        17:  'Bridges',
-        18:  'UnWanted/Bad',
-        19:  'UnSurveyed',
-        20:  'Sea Areas',
-    }
-    
+
     # ============================================================
     # Output Configuration
     # ============================================================
     COMPRESSION: str = 'LZW'
     OUTPUT_EPSG_LIST: List[int] = [3857, 3395]  # Plus source CRS
-    
+
     # ============================================================
     # Border Detection Configuration
     # ============================================================
     BORDER_SAMPLE_SIZE: int = 20  # Pixels to sample from edge
-    BORDER_THRESHOLD: float = 0.9  # 90% same color = border
-    
+    BORDER_THRESHOLD: float = 0.9  # 90% same colour = border
+
     # ============================================================
     # Shapefile Attribute Field Names (flexible matching)
     # ============================================================
+    # The existing tool may use any of these column names for the
+    # classification code.  Check all variations incl. mixed case.
     SHAPEFILE_CODE_FIELDS: List[str] = [
         'code', 'CODE', 'Code',
         'type', 'TYPE', 'Type',
-        'class', 'CLASS', 'Class'
+        'class', 'CLASS', 'Class',
+        'value', 'VALUE', 'Value',
+        'bds_code', 'BDS_CODE', 'BdsCode',
+        'cls', 'CLS', 'Cls',
     ]
-    
+
+    # ============================================================
+    # Methods
+    # ============================================================
+
     @classmethod
     def _check_db_credentials(cls):
         """Validate that required database credentials are set via environment variables.
-        
+
         Raises:
             SystemExit: If DB_USER or DB_PASSWORD are not set
         """
@@ -194,7 +253,7 @@ class Config:
             missing.append('DB_USER')
         if not cls.DB_PASSWORD:
             missing.append('DB_PASSWORD')
-        
+
         if missing:
             print(
                 f"\n{'='*60}\n"
@@ -207,14 +266,14 @@ class Config:
                 file=sys.stderr
             )
             sys.exit(1)
-    
+
     @classmethod
     def get_db_connection(cls):
         """Create and return a psycopg2 database connection.
-        
+
         Returns:
             psycopg2.connection: Database connection object
-            
+
         Raises:
             psycopg2.Error: If connection fails
             SystemExit: If credentials not set
@@ -229,14 +288,14 @@ class Config:
             sslmode=cls.DB_SSLMODE
         )
         return conn
-    
+
     @classmethod
     def get_engine(cls) -> Engine:
         """Create and return a SQLAlchemy engine.
-        
+
         Returns:
             Engine: SQLAlchemy engine for database operations
-            
+
         Raises:
             SystemExit: If credentials not set
         """
@@ -248,14 +307,14 @@ class Config:
         )
         engine = create_engine(connection_string)
         return engine
-    
+
     @classmethod
     def get_connection_string(cls) -> str:
         """Get PostgreSQL connection string for command-line tools.
-        
+
         Returns:
             str: Connection string in format suitable for psql/ogr2ogr
-            
+
         Raises:
             SystemExit: If credentials not set
         """
@@ -265,32 +324,37 @@ class Config:
             f"dbname={cls.DB_NAME} user={cls.DB_USER} "
             f"password={cls.DB_PASSWORD} sslmode={cls.DB_SSLMODE}"
         )
-    
+
     @classmethod
     def ensure_output_dirs(cls):
         """Create all output directories if they don't exist."""
         for path in [
             cls.OUTPUT_MASKS,
+            cls.OUTPUT_INITIAL_MASKS,
+            cls.OUTPUT_CORRECTED_MASKS,
+            cls.OUTPUT_DIFF_MASKS,
             cls.OUTPUT_TRANSPARENT_SOURCE,
             cls.OUTPUT_TRANSPARENT_3857,
             cls.OUTPUT_TRANSPARENT_3395,
             cls.OUTPUT_TILES,
-            cls.MODELS_DIR
+            cls.OUTPUT_PREDICTIONS,
+            cls.OUTPUT_VECTORS,
+            cls.MODELS_DIR,
         ]:
             path.mkdir(parents=True, exist_ok=True)
-    
+
     @classmethod
     def get_origin_path(cls, origin: str) -> Path:
         """Get the path for a specific chart origin.
-        
+
         Args:
             origin: Chart origin ('ukho', 'shom', 'bsh')
-            
+
         Returns:
             Path: Path to the origin's chart directory
-            
+
         Raises:
-            ValueError: If origin is not recognized
+            ValueError: If origin is not recognised
         """
         origin_lower = origin.lower()
         if origin_lower == 'ukho':
@@ -301,35 +365,66 @@ class Config:
             return cls.CHARTS_BSH
         else:
             raise ValueError(f"Unknown origin: {origin}")
-    
+
     @classmethod
-    def map_shapefile_code(cls, code) -> Optional[int]:
-        """Map a shapefile code to ML class index, handling nulls and skips.
-        
+    def native_code_to_class_index(cls, code) -> Optional[int]:
+        """Convert a native shapefile code to a contiguous ML class index.
+
+        Code -20 (Ignore) returns None — callers should skip these features.
+        Null/NaN codes are treated as Not Sure (-1 → index 0).
+        Unknown codes are also treated as Not Sure.
+
         Args:
-            code: Shapefile code value (int, float, None, or NaN)
-            
+            code: Native classification code (int, float, None, or NaN)
+
         Returns:
-            ML class index (0=sea, 1=land, 2=exclude), or None if code should be skipped
+            Class index (0–16), or None if the code should be skipped
         """
-        # Handle null/NaN → exclude
         if code is None:
-            return 2
+            return cls.NATIVE_CODE_TO_CLASS_INDEX.get(-1, 0)
         try:
             import numpy as np
             if np.isnan(float(code)):
-                return 2
+                return cls.NATIVE_CODE_TO_CLASS_INDEX.get(-1, 0)
         except (ValueError, TypeError):
-            return 2
-        
+            return cls.NATIVE_CODE_TO_CLASS_INDEX.get(-1, 0)
+
         code_int = int(code)
-        
-        # Skip codes (e.g. -20 Ignore)
+
         if code_int in cls.SHAPEFILE_SKIP_CODES:
             return None
-        
-        # Look up in map; default unknown codes to exclude
-        return cls.SHAPEFILE_CODE_MAP.get(code_int, 2)
+
+        return cls.NATIVE_CODE_TO_CLASS_INDEX.get(
+            code_int,
+            cls.NATIVE_CODE_TO_CLASS_INDEX[-1]  # unknown → Not Sure
+        )
+
+    @classmethod
+    def class_index_to_native_code(cls, class_index: int) -> int:
+        """Convert a contiguous ML class index back to a native shapefile code.
+
+        Args:
+            class_index: ML class index (0–16)
+
+        Returns:
+            Native classification code
+        """
+        return cls.CLASS_INDEX_TO_NATIVE_CODE.get(class_index, -1)
+
+    @classmethod
+    def map_shapefile_code(cls, code) -> Optional[int]:
+        """Map a shapefile code to ML class index (alias for native_code_to_class_index).
+
+        Kept for backward compatibility.  New code should call
+        ``native_code_to_class_index`` directly.
+
+        Args:
+            code: Shapefile code value (int, float, None, or NaN)
+
+        Returns:
+            ML class index (0–16), or None if code should be skipped
+        """
+        return cls.native_code_to_class_index(code)
 
 
 # Convenience instance for direct import

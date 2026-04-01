@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS dev_rcxl.charts (
     chart_id SERIAL PRIMARY KEY,
     filename TEXT UNIQUE NOT NULL,
     source_path TEXT,
+    preprocessed_path TEXT,          -- path to palette-converted RGB copy
+    color_mode TEXT DEFAULT 'rgb' CHECK (color_mode IN ('rgb', 'paletted')),
     crs_epsg INTEGER DEFAULT 4326,
     pixel_width INTEGER,
     pixel_height INTEGER,
@@ -36,17 +38,27 @@ CREATE TABLE IF NOT EXISTS dev_rcxl.charts (
 CREATE INDEX IF NOT EXISTS idx_charts_bbox ON dev_rcxl.charts USING GIST (bbox);
 CREATE INDEX IF NOT EXISTS idx_charts_filename ON dev_rcxl.charts (filename);
 CREATE INDEX IF NOT EXISTS idx_charts_status ON dev_rcxl.charts (status);
+CREATE INDEX IF NOT EXISTS idx_charts_color_mode ON dev_rcxl.charts (color_mode);
 
 -- ============================================================
 -- Table: ground_truth
--- Training polygons providing COMPLETE coverage of chart
+-- Training polygons using native classification codes (-20 to 20).
+-- Stores individual features (not dissolved by class) so that the ML
+-- model can learn from the full classification detail.
+-- Provenance tracks whether the polygon comes from the initial tool
+-- output or the human-corrected version.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS dev_rcxl.ground_truth (
     gt_id SERIAL PRIMARY KEY,
     chart_id INTEGER NOT NULL REFERENCES dev_rcxl.charts(chart_id) ON DELETE CASCADE,
-    class_type TEXT NOT NULL CHECK (class_type IN ('sea', 'land', 'exclude')),
-    source_format TEXT,  -- 'geotiff_mask' or 'shapefile'
-    source_file TEXT,
+    -- Native classification code from the existing tool (-20 to 20)
+    native_code INTEGER NOT NULL,
+    -- Human-readable name corresponding to native_code
+    code_name TEXT,
+    -- 'initial' = from existing tool output; 'corrected' = human-corrected
+    provenance TEXT NOT NULL DEFAULT 'initial' CHECK (provenance IN ('initial', 'corrected')),
+    source_format TEXT,   -- 'shapefile' or 'geotiff_mask'
+    source_file TEXT,     -- path to originating file
     geom GEOMETRY(MULTIPOLYGON, 4326),
     pixel_area BIGINT,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -55,17 +67,22 @@ CREATE TABLE IF NOT EXISTS dev_rcxl.ground_truth (
 -- Indexes for ground_truth
 CREATE INDEX IF NOT EXISTS idx_ground_truth_chart_id ON dev_rcxl.ground_truth (chart_id);
 CREATE INDEX IF NOT EXISTS idx_ground_truth_geom ON dev_rcxl.ground_truth USING GIST (geom);
-CREATE INDEX IF NOT EXISTS idx_ground_truth_class_type ON dev_rcxl.ground_truth (class_type);
+CREATE INDEX IF NOT EXISTS idx_ground_truth_native_code ON dev_rcxl.ground_truth (native_code);
+CREATE INDEX IF NOT EXISTS idx_ground_truth_provenance ON dev_rcxl.ground_truth (provenance);
 
 -- ============================================================
 -- Table: predicted_polygons
--- ML-predicted polygons providing COMPLETE coverage
+-- ML-corrected classification polygons using native codes.
+-- This is the authoritative output of the inference pipeline and is
+-- used to generate final raster products (transparent GeoTIFFs).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS dev_rcxl.predicted_polygons (
     pred_id SERIAL PRIMARY KEY,
     chart_id INTEGER NOT NULL REFERENCES dev_rcxl.charts(chart_id) ON DELETE CASCADE,
     model_version TEXT NOT NULL,
-    class_type TEXT NOT NULL CHECK (class_type IN ('sea', 'land', 'exclude')),
+    -- Native classification code (-20 to 20)
+    native_code INTEGER NOT NULL,
+    code_name TEXT,
     confidence_mean DOUBLE PRECISION,
     geom GEOMETRY(MULTIPOLYGON, 4326),
     pixel_area BIGINT,
@@ -80,6 +97,7 @@ CREATE TABLE IF NOT EXISTS dev_rcxl.predicted_polygons (
 CREATE INDEX IF NOT EXISTS idx_predicted_polygons_chart_id ON dev_rcxl.predicted_polygons (chart_id);
 CREATE INDEX IF NOT EXISTS idx_predicted_polygons_geom ON dev_rcxl.predicted_polygons USING GIST (geom);
 CREATE INDEX IF NOT EXISTS idx_predicted_polygons_model_version ON dev_rcxl.predicted_polygons (model_version);
+CREATE INDEX IF NOT EXISTS idx_predicted_polygons_native_code ON dev_rcxl.predicted_polygons (native_code);
 
 -- ============================================================
 -- Table: output_files
@@ -130,7 +148,8 @@ CREATE TABLE IF NOT EXISTS dev_rcxl.models (
     model_version TEXT NOT NULL UNIQUE,
     architecture TEXT,
     tile_size INTEGER,
-    num_classes INTEGER DEFAULT 3,
+    num_classes INTEGER DEFAULT 17,
+    in_channels INTEGER DEFAULT 4,   -- 3 RGB + 1 initial classification
     training_charts INTEGER,
     val_iou DOUBLE PRECISION,
     val_accuracy DOUBLE PRECISION,

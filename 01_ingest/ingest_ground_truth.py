@@ -1,18 +1,28 @@
 """
 Ground Truth Ingestion Script
 
-Loads ground truth data from shapefiles and GeoTIFF masks, matching them to
-registered charts by filename. Inserts complete coverage polygons (sea, land, exclude)
-into the database.
+Ingests shapefiles produced by the existing classification tool and (for
+training) their human-corrected counterparts.  Each polygon is stored with
+its native classification code (-20 to 20) rather than being dissolved into
+a simplified 3-class representation.
 
-Features:
-- Shapefile processing with full classification code mapping (20 codes)
-- Handles null/NaN codes (defaults to exclude)
-- Skips Ignore features (code -20)
-- GeoTIFF mask processing (alpha channel detection)
-- Automatic reprojection to EPSG:4326
-- Polygon dissolution by class type
-- Comprehensive logging with code names
+Two provenances are tracked:
+  * initial   — shapefile from the existing tool (auto-classification)
+  * corrected — human-corrected shapefile (training target)
+
+Both shapefiles use the same classification code system.  Code -20 (Ignore)
+features are skipped entirely.  Code -1 (Not Sure) is ingested and treated
+as needing classification.
+
+Usage:
+    # Ingest initial shapefiles only
+    python 01_ingest/ingest_ground_truth.py --provenance initial
+
+    # Ingest both initial and corrected (training mode)
+    python 01_ingest/ingest_ground_truth.py --provenance both
+
+    # Single chart
+    python 01_ingest/ingest_ground_truth.py --chart-id 42 --provenance both
 """
 
 import argparse
@@ -20,13 +30,11 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import geopandas as gpd
-import rasterio
-from rasterio.features import shapes
-from shapely.geometry import shape, MultiPolygon, mapping
+from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 import psycopg2
 
@@ -34,28 +42,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config
 
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
 def find_chart_by_filename(conn, base_filename: str) -> Optional[Tuple[int, str]]:
-    """
-    Find chart in database by base filename (without extension).
-    
+    """Find chart in database by base filename (without extension).
+
     Args:
         conn: Database connection
         base_filename: Filename without extension
-        
+
     Returns:
         Tuple of (chart_id, full_filename) or None if not found
     """
     try:
         with conn.cursor() as cur:
-            # Try exact match first
             cur.execute(
                 "SELECT chart_id, filename FROM dev_rcxl.charts WHERE filename = %s",
                 (f"{base_filename}.tif",)
@@ -63,8 +72,7 @@ def find_chart_by_filename(conn, base_filename: str) -> Optional[Tuple[int, str]
             result = cur.fetchone()
             if result:
                 return result
-            
-            # Try case-insensitive match
+
             cur.execute(
                 "SELECT chart_id, filename FROM dev_rcxl.charts WHERE LOWER(filename) = LOWER(%s)",
                 (f"{base_filename}.tif",)
@@ -72,347 +80,17 @@ def find_chart_by_filename(conn, base_filename: str) -> Optional[Tuple[int, str]
             result = cur.fetchone()
             if result:
                 return result
-            
-            # Try without extension matching
+
             cur.execute(
-                """SELECT chart_id, filename FROM dev_rcxl.charts 
+                """SELECT chart_id, filename FROM dev_rcxl.charts
                    WHERE LOWER(REPLACE(filename, '.tif', '')) = LOWER(%s)""",
                 (base_filename,)
             )
-            result = cur.fetchone()
-            return result
-            
+            return cur.fetchone()
+
     except Exception as e:
         logger.error(f"Error finding chart: {e}")
         return None
-
-
-def find_code_field(gdf: gpd.GeoDataFrame) -> Optional[str]:
-    """
-    Find the attribute field containing class codes.
-    
-    Tries various common field names: code, CODE, type, TYPE, class, CLASS, etc.
-    
-    Args:
-        gdf: GeoDataFrame
-        
-    Returns:
-        Field name or None if not found
-    """
-    for field_name in Config.SHAPEFILE_CODE_FIELDS:
-        if field_name in gdf.columns:
-            return field_name
-    
-    logger.warning(f"No recognized code field found. Available fields: {list(gdf.columns)}")
-    return None
-
-
-def process_shapefile(shp_path: Path, conn, dry_run: bool = False) -> Tuple[bool, Optional[int]]:
-    """
-    Process a ground truth shapefile.
-    
-    Handles all classification codes:
-    - Code 20 (Sea) -> class 'sea'
-    - Codes 10, 17 (Land, Bridges) -> class 'land'
-    - All other codes (0-19 except above) -> class 'exclude'
-    - Code -20 (Ignore) -> skipped entirely
-    - Null/NaN codes -> class 'exclude'
-    
-    Args:
-        shp_path: Path to shapefile
-        conn: Database connection
-        dry_run: If True, don't insert into database
-        
-    Returns:
-        Tuple of (success: bool, chart_id: Optional[int])
-    """
-    start_time = time.time()
-    
-    try:
-        # Extract base filename
-        base_filename = shp_path.stem
-        
-        # Find matching chart
-        chart_info = find_chart_by_filename(conn, base_filename)
-        if not chart_info:
-            logger.warning(f"No matching chart found for {base_filename}")
-            return False, None
-        
-        chart_id, chart_filename = chart_info
-        logger.info(f"Processing shapefile for chart {chart_filename} (ID: {chart_id})")
-        
-        # Read shapefile
-        gdf = gpd.read_file(shp_path)
-        
-        if len(gdf) == 0:
-            logger.warning(f"Empty shapefile: {shp_path}")
-            return False, chart_id
-        
-        # Find code field
-        code_field = find_code_field(gdf)
-        if not code_field:
-            logger.error(f"Could not find code field in shapefile: {shp_path}")
-            return False, chart_id
-        
-        # Log unique codes found
-        unique_codes = gdf[code_field].unique()
-        logger.info(f"  Codes found: {sorted([c for c in unique_codes if c is not None and not (isinstance(c, float) and np.isnan(c))])}")
-        
-        # Handle null codes: fill NaN with a sentinel, then process
-        # We'll process nulls separately
-        null_mask = gdf[code_field].isna()
-        if null_mask.any():
-            logger.info(f"  Found {null_mask.sum()} features with null/empty code -> treating as exclude")
-        
-        # Reproject to EPSG:4326 if needed
-        if gdf.crs and gdf.crs.to_epsg() != 4326:
-            logger.info(f"  Reprojecting from {gdf.crs} to EPSG:4326")
-            gdf = gdf.to_crs(epsg=4326)
-        
-        # Collect geometries by ML class
-        class_geometries: Dict[str, list] = {
-            'sea': [],
-            'land': [],
-            'exclude': []
-        }
-        
-        skipped_count = 0
-        
-        for idx, row in gdf.iterrows():
-            code = row[code_field]
-            
-            # Use Config.map_shapefile_code() for proper mapping
-            class_idx = Config.map_shapefile_code(code)
-            
-            if class_idx is None:
-                # Skip this feature (e.g. code -20 Ignore)
-                code_name = Config.SHAPEFILE_CODE_NAMES.get(int(code), 'Unknown') if code is not None else 'null'
-                logger.debug(f"  Skipping feature with code {code} ({code_name})")
-                skipped_count += 1
-                continue
-            
-            class_type = Config.CLASS_MAP[class_idx]
-            geom = row.geometry
-            
-            if geom is not None and not geom.is_empty:
-                class_geometries[class_type].append(geom)
-        
-        if skipped_count > 0:
-            logger.info(f"  Skipped {skipped_count} Ignore features (code -20)")
-        
-        # Insert dissolved geometries by class
-        inserted_count = 0
-        
-        for class_type, geoms in class_geometries.items():
-            if not geoms:
-                continue
-            
-            # Dissolve geometries into single MultiPolygon
-            dissolved = unary_union(geoms)
-            
-            # Convert to MultiPolygon if needed
-            if dissolved.geom_type == 'Polygon':
-                multipolygon = MultiPolygon([dissolved])
-            elif dissolved.geom_type == 'MultiPolygon':
-                multipolygon = dissolved
-            elif dissolved.geom_type == 'GeometryCollection':
-                # Extract only polygon types from collection
-                polys = [g for g in dissolved.geoms if g.geom_type in ('Polygon', 'MultiPolygon')]
-                if not polys:
-                    logger.warning(f"  No polygons in GeometryCollection for {class_type}")
-                    continue
-                multipolygon = MultiPolygon(polys) if len(polys) > 1 else (polys[0] if polys[0].geom_type == 'MultiPolygon' else MultiPolygon(polys))
-            else:
-                logger.warning(f"  Unexpected geometry type: {dissolved.geom_type}")
-                continue
-            
-            # Calculate pixel area (approximate)
-            pixel_area = int(multipolygon.area * 1e10)  # Rough estimate
-            
-            logger.info(f"  {class_type}: {len(geoms)} features dissolved into {len(multipolygon.geoms)} polygons")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would insert {class_type} polygon for chart {chart_id}")
-                inserted_count += 1
-            else:
-                # Insert into database
-                try:
-                    with conn.cursor() as cur:
-                        insert_sql = """
-                            INSERT INTO dev_rcxl.ground_truth
-                            (chart_id, class_type, source_format, source_file, geom, pixel_area)
-                            VALUES (%s, %s, 'shapefile', %s, ST_GeomFromText(%s, 4326), %s)
-                        """
-                        cur.execute(insert_sql, (
-                            chart_id,
-                            class_type,
-                            str(shp_path),
-                            multipolygon.wkt,
-                            pixel_area
-                        ))
-                    conn.commit()
-                    logger.info(f"  Inserted {class_type} polygon for chart {chart_id}")
-                    inserted_count += 1
-                except Exception as e:
-                    logger.error(f"  Failed to insert ground truth: {e}")
-                    conn.rollback()
-        
-        duration = time.time() - start_time
-        
-        if not dry_run and inserted_count > 0:
-            log_processing(conn, chart_id, 'ingest_ground_truth', 'success',
-                          f"Inserted {inserted_count} ground truth polygons from shapefile", duration)
-        
-        return True, chart_id
-        
-    except Exception as e:
-        logger.error(f"Error processing shapefile {shp_path}: {e}")
-        return False, None
-
-
-def process_geotiff_mask(tif_path: Path, conn, dry_run: bool = False) -> Tuple[bool, Optional[int]]:
-    """
-    Process a ground truth GeoTIFF mask.
-    
-    These are RGBA images where land has been made transparent (alpha=0).
-    Sea pixels have alpha > 0 (opaque).
-    
-    Args:
-        tif_path: Path to GeoTIFF mask
-        conn: Database connection
-        dry_run: If True, don't insert into database
-        
-    Returns:
-        Tuple of (success: bool, chart_id: Optional[int])
-    """
-    start_time = time.time()
-    
-    try:
-        # Extract base filename
-        base_filename = tif_path.stem
-        # Remove _mask suffix if present
-        base_filename = base_filename.replace('_mask', '').replace('_MASK', '')
-        
-        # Find matching chart
-        chart_info = find_chart_by_filename(conn, base_filename)
-        if not chart_info:
-            logger.warning(f"No matching chart found for {base_filename}")
-            return False, None
-        
-        chart_id, chart_filename = chart_info
-        logger.info(f"Processing GeoTIFF mask for chart {chart_filename} (ID: {chart_id})")
-        
-        with rasterio.open(tif_path) as src:
-            # Check if alpha band exists
-            if src.count < 4:
-                logger.warning(f"No alpha band found in {tif_path}")
-                return False, chart_id
-            
-            # Read alpha band (band 4 for RGBA)
-            alpha = src.read(4)
-            
-            # Create masks: sea (alpha > 0), land (alpha == 0)
-            sea_mask = (alpha > 0).astype(np.uint8)
-            land_mask = (alpha == 0).astype(np.uint8)
-            
-            transform = src.transform
-            crs = src.crs
-            
-            inserted_count = 0
-            
-            # Vectorize sea polygons
-            if sea_mask.sum() > 0:
-                sea_shapes = list(shapes(sea_mask, mask=sea_mask, transform=transform))
-                sea_geoms = [shape(geom) for geom, value in sea_shapes if value == 1]
-                
-                if sea_geoms:
-                    sea_union = unary_union(sea_geoms)
-                    if sea_union.geom_type == 'Polygon':
-                        sea_multipolygon = MultiPolygon([sea_union])
-                    else:
-                        sea_multipolygon = sea_union
-                    
-                    # Reproject to EPSG:4326 if needed
-                    if crs and crs.to_epsg() != 4326:
-                        gdf_temp = gpd.GeoDataFrame({'geometry': [sea_multipolygon]}, crs=crs)
-                        gdf_temp = gdf_temp.to_crs(epsg=4326)
-                        sea_multipolygon = gdf_temp.geometry.iloc[0]
-                    
-                    pixel_area = int(sea_mask.sum())
-                    
-                    if dry_run:
-                        logger.info(f"[DRY RUN] Would insert sea polygon for chart {chart_id}")
-                        inserted_count += 1
-                    else:
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO dev_rcxl.ground_truth
-                                    (chart_id, class_type, source_format, source_file, geom, pixel_area)
-                                    VALUES (%s, 'sea', 'geotiff_mask', %s, ST_GeomFromText(%s, 4326), %s)
-                                    """,
-                                    (chart_id, str(tif_path), sea_multipolygon.wkt, pixel_area)
-                                )
-                            conn.commit()
-                            logger.info(f"Inserted sea polygon for chart {chart_id}")
-                            inserted_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to insert sea polygon: {e}")
-                            conn.rollback()
-            
-            # Vectorize land polygons
-            if land_mask.sum() > 0:
-                land_shapes = list(shapes(land_mask, mask=land_mask, transform=transform))
-                land_geoms = [shape(geom) for geom, value in land_shapes if value == 1]
-                
-                if land_geoms:
-                    land_union = unary_union(land_geoms)
-                    if land_union.geom_type == 'Polygon':
-                        land_multipolygon = MultiPolygon([land_union])
-                    else:
-                        land_multipolygon = land_union
-                    
-                    # Reproject to EPSG:4326 if needed
-                    if crs and crs.to_epsg() != 4326:
-                        gdf_temp = gpd.GeoDataFrame({'geometry': [land_multipolygon]}, crs=crs)
-                        gdf_temp = g_temp.to_crs(epsg=4326)
-                        land_multipolygon = gdf_temp.geometry.iloc[0]
-                    
-                    pixel_area = int(land_mask.sum())
-                    
-                    if dry_run:
-                        logger.info(f"[DRY RUN] Would insert land polygon for chart {chart_id}")
-                        inserted_count += 1
-                    else:
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    INSERT INTO dev_rcxl.ground_truth
-                                    (chart_id, class_type, source_format, source_file, geom, pixel_area)
-                                    VALUES (%s, 'land', 'geotiff_mask', %s, ST_GeomFromText(%s, 4326), %s)
-                                    """,
-                                    (chart_id, str(tif_path), land_multipolygon.wkt, pixel_area)
-                                )
-                            conn.commit()
-                            logger.info(f"Inserted land polygon for chart {chart_id}")
-                            inserted_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to insert land polygon: {e}")
-                            conn.rollback()
-        
-        duration = time.time() - start_time
-        
-        if not dry_run and inserted_count > 0:
-            log_processing(conn, chart_id, 'ingest_ground_truth', 'success',
-                          f"Inserted {inserted_count} ground truth polygons from GeoTIFF", duration)
-        
-        return True, chart_id
-        
-    except Exception as e:
-        logger.error(f"Error processing GeoTIFF mask {tif_path}: {e}")
-        return False, None
 
 
 def log_processing(conn, chart_id: Optional[int], step: str, status: str,
@@ -434,104 +112,397 @@ def log_processing(conn, chart_id: Optional[int], step: str, status: str,
         conn.rollback()
 
 
+# ---------------------------------------------------------------------------
+# Shapefile utilities
+# ---------------------------------------------------------------------------
+
+def find_code_field(gdf: gpd.GeoDataFrame) -> Optional[str]:
+    """Find the attribute field containing native classification codes.
+
+    Tries all recognised field names from Config.SHAPEFILE_CODE_FIELDS.
+
+    Args:
+        gdf: GeoDataFrame
+
+    Returns:
+        Field name or None if not found
+    """
+    for field_name in Config.SHAPEFILE_CODE_FIELDS:
+        if field_name in gdf.columns:
+            return field_name
+
+    logger.warning(
+        f"No recognised code field found. Available fields: {list(gdf.columns)}"
+    )
+    return None
+
+
+def geometry_to_multipolygon(geom) -> Optional[MultiPolygon]:
+    """Coerce a geometry to MultiPolygon, returning None on failure."""
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type == 'Polygon':
+        return MultiPolygon([geom])
+    if geom.geom_type == 'MultiPolygon':
+        return geom
+    if geom.geom_type == 'GeometryCollection':
+        polys = [g for g in geom.geoms if g.geom_type in ('Polygon', 'MultiPolygon')]
+        if not polys:
+            return None
+        flat: List[Polygon] = []
+        for p in polys:
+            if p.geom_type == 'Polygon':
+                flat.append(p)
+            else:
+                flat.extend(p.geoms)
+        return MultiPolygon(flat) if flat else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Core ingestion
+# ---------------------------------------------------------------------------
+
+def insert_ground_truth_polygon(
+    conn,
+    chart_id: int,
+    native_code: int,
+    provenance: str,
+    source_file: str,
+    multipolygon: MultiPolygon,
+) -> bool:
+    """Insert a single ground truth polygon into the database.
+
+    Args:
+        conn: Database connection
+        chart_id: Chart ID
+        native_code: Native classification code
+        provenance: 'initial' or 'corrected'
+        source_file: Source shapefile path (for tracing)
+        multipolygon: Geometry to insert
+
+    Returns:
+        True on success, False on failure
+    """
+    code_name = Config.SHAPEFILE_CODE_NAMES.get(native_code, str(native_code))
+    pixel_area = int(multipolygon.area * 1e10)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dev_rcxl.ground_truth
+                    (chart_id, native_code, code_name, provenance,
+                     source_format, source_file, geom, pixel_area)
+                VALUES (%s, %s, %s, %s, 'shapefile', %s, ST_GeomFromText(%s, 4326), %s)
+                """,
+                (
+                    chart_id,
+                    native_code,
+                    code_name,
+                    provenance,
+                    source_file,
+                    multipolygon.wkt,
+                    pixel_area,
+                )
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to insert ground truth: {e}")
+        conn.rollback()
+        return False
+
+
+def process_shapefile(
+    shp_path: Path,
+    provenance: str,
+    conn,
+    dry_run: bool = False,
+) -> Tuple[bool, Optional[int]]:
+    """Process one shapefile and ingest its features into ground_truth.
+
+    Features are stored with their native classification codes rather than
+    being dissolved into the old 3-class system.  Each unique code value
+    produces one MultiPolygon row (all features with that code dissolved
+    together).
+
+    Args:
+        shp_path: Path to shapefile
+        provenance: 'initial' or 'corrected'
+        conn: Database connection
+        dry_run: If True, skip database writes
+
+    Returns:
+        Tuple of (success: bool, chart_id: Optional[int])
+    """
+    start_time = time.time()
+
+    try:
+        base_filename = shp_path.stem
+
+        chart_info = find_chart_by_filename(conn, base_filename)
+        if not chart_info:
+            logger.warning(f"No matching chart found for {base_filename}")
+            return False, None
+
+        chart_id, chart_filename = chart_info
+        logger.info(
+            f"Processing [{provenance}] {shp_path.name} → chart {chart_filename} (ID: {chart_id})"
+        )
+
+        gdf = gpd.read_file(shp_path)
+
+        if len(gdf) == 0:
+            logger.warning(f"Empty shapefile: {shp_path}")
+            return False, chart_id
+
+        code_field = find_code_field(gdf)
+        if not code_field:
+            logger.error(f"Could not find code field in {shp_path}")
+            return False, chart_id
+
+        # Reproject to EPSG:4326 for storage
+        if gdf.crs and gdf.crs.to_epsg() != 4326:
+            logger.info(f"  Reprojecting from {gdf.crs} to EPSG:4326")
+            gdf = gdf.to_crs(epsg=4326)
+
+        # Group geometries by native code
+        code_to_geoms: Dict[int, list] = {}
+        skipped = 0
+
+        for _, row in gdf.iterrows():
+            raw_code = row[code_field]
+
+            # Skip -20 (Ignore)
+            try:
+                code_int = int(float(raw_code)) if raw_code is not None else None
+            except (ValueError, TypeError):
+                code_int = None
+
+            if code_int is None or (
+                not np.isnan(float(raw_code))
+                if isinstance(raw_code, float)
+                else False
+            ):
+                pass  # code_int already set
+
+            # Handle NaN → treat as -1 (Not Sure)
+            if code_int is None:
+                try:
+                    if np.isnan(float(raw_code)):
+                        code_int = -1
+                except (ValueError, TypeError):
+                    code_int = -1
+
+            if code_int in Config.SHAPEFILE_SKIP_CODES:
+                skipped += 1
+                continue
+
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+
+            if code_int not in code_to_geoms:
+                code_to_geoms[code_int] = []
+            code_to_geoms[code_int].append(geom)
+
+        if skipped:
+            logger.info(f"  Skipped {skipped} Ignore features (code -20)")
+
+        # Log summary of codes found
+        code_summary = {
+            code: f"{len(geoms)} features ({Config.SHAPEFILE_CODE_NAMES.get(code, '?')})"
+            for code, geoms in sorted(code_to_geoms.items())
+        }
+        logger.info(f"  Codes: {code_summary}")
+
+        # Delete existing ground_truth rows for this chart+provenance before re-inserting
+        if not dry_run:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM dev_rcxl.ground_truth
+                        WHERE chart_id = %s AND provenance = %s
+                        """,
+                        (chart_id, provenance)
+                    )
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to clear existing ground truth: {e}")
+                conn.rollback()
+
+        inserted = 0
+        for native_code, geoms in sorted(code_to_geoms.items()):
+            dissolved = unary_union(geoms)
+            mp = geometry_to_multipolygon(dissolved)
+            if mp is None:
+                logger.warning(f"  Could not convert code {native_code} to MultiPolygon")
+                continue
+
+            code_name = Config.SHAPEFILE_CODE_NAMES.get(native_code, str(native_code))
+            logger.info(
+                f"  Code {native_code} ({code_name}): "
+                f"{len(geoms)} features → {len(mp.geoms)} polygons"
+            )
+
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would insert code {native_code} for chart {chart_id}")
+                inserted += 1
+            else:
+                if insert_ground_truth_polygon(
+                    conn, chart_id, native_code, provenance, str(shp_path), mp
+                ):
+                    inserted += 1
+
+        duration = time.time() - start_time
+        logger.info(
+            f"  Inserted {inserted} ground truth rows in {duration:.2f}s"
+        )
+
+        if not dry_run:
+            log_processing(
+                conn, chart_id, f'ingest_ground_truth_{provenance}', 'success',
+                f"Inserted {inserted} native-code polygons from {shp_path.name}",
+                duration
+            )
+
+        return True, chart_id
+
+    except Exception as e:
+        logger.error(f"Error processing shapefile {shp_path}: {e}")
+        return False, None
+
+
+def scan_and_ingest_shapefiles(
+    shp_dir: Path,
+    provenance: str,
+    conn,
+    dry_run: bool = False,
+) -> Tuple[int, int, int]:
+    """Scan a directory for shapefiles and ingest them.
+
+    Args:
+        shp_dir: Directory to scan
+        provenance: 'initial' or 'corrected'
+        conn: Database connection
+        dry_run: Dry-run mode
+
+    Returns:
+        Tuple of (ingested, skipped, errors)
+    """
+    if not shp_dir.exists():
+        logger.warning(f"Shapefile directory does not exist: {shp_dir}")
+        return 0, 0, 0
+
+    shp_files = sorted(shp_dir.rglob('*.shp'))
+    logger.info(f"Found {len(shp_files)} shapefiles in {shp_dir}")
+
+    ingested = skipped = errors = 0
+
+    for shp_path in shp_files:
+        success, chart_id = process_shapefile(shp_path, provenance, conn, dry_run)
+        if success:
+            ingested += 1
+        elif chart_id is None:
+            # Chart not found
+            skipped += 1
+        else:
+            errors += 1
+
+    return ingested, skipped, errors
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
-    """Main entry point for ground truth ingestion script."""
     parser = argparse.ArgumentParser(
-        description='Ingest ground truth data from shapefiles and GeoTIFF masks'
+        description='Ingest initial and/or corrected shapefiles into ground_truth table'
     )
     parser.add_argument(
-        '--source-format',
-        type=str,
-        choices=['shp', 'tif', 'both'],
+        '--provenance',
+        choices=['initial', 'corrected', 'both'],
         default='both',
-        help='Source format to process (default: both)'
+        help=(
+            'Which shapefiles to ingest: '
+            'initial (from existing tool), corrected (human-corrected), or both'
+        ),
     )
     parser.add_argument(
-        '--data-dir',
+        '--initial-dir',
         type=Path,
-        default=Config.GROUND_TRUTH_BASE,
-        help='Base directory containing ground truth data (default: /data/charts/ground_truth)'
+        default=Config.INITIAL_SHP_BASE,
+        help='Directory containing initial shapefiles (default: /data/charts/initial_shp)',
+    )
+    parser.add_argument(
+        '--corrected-dir',
+        type=Path,
+        default=Config.CORRECTED_SHP_BASE,
+        help='Directory containing corrected shapefiles (default: /data/charts/corrected_shp)',
+    )
+    parser.add_argument(
+        '--chart-id',
+        type=int,
+        default=None,
+        help='Process a specific chart ID only',
     )
     parser.add_argument(
         '--dry-run',
         action='store_true',
-        help='Process files but do not insert into database'
+        help='Scan files but do not insert into database',
     )
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Enable verbose logging'
-    )
-    
+    parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
-    
+
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    
-    logger.info("=" * 60)
-    logger.info("Ground Truth Ingestion Script")
-    logger.info("=" * 60)
-    logger.info(f"Data directory: {args.data_dir}")
-    logger.info(f"Source format: {args.source_format}")
-    logger.info(f"Dry run: {args.dry_run}")
-    logger.info(f"Code mapping: {len(Config.SHAPEFILE_CODE_MAP)} codes -> 3 classes")
-    logger.info(f"Skip codes: {Config.SHAPEFILE_SKIP_CODES}")
-    logger.info("=" * 60)
-    
-    # Connect to database
+
+    logger.info('=' * 60)
+    logger.info('Ground Truth Ingestion Script')
+    logger.info('=' * 60)
+    logger.info(f'  Provenance : {args.provenance}')
+    logger.info(f'  Initial dir: {args.initial_dir}')
+    logger.info(f'  Corrected  : {args.corrected_dir}')
+    logger.info(f'  Dry run    : {args.dry_run}')
+    logger.info('=' * 60)
+
     try:
         conn = Config.get_db_connection()
         logger.info("Database connection established")
     except Exception as e:
         logger.error(f"Failed to connect to database: {e}")
         sys.exit(1)
-    
+
+    total_ingested = total_skipped = total_errors = 0
+
     try:
-        success_count = 0
-        error_count = 0
-        
-        # Process shapefiles
-        if args.source_format in ['shp', 'both']:
-            shp_dir = args.data_dir / 'shp'
-            if shp_dir.exists():
-                logger.info(f"Scanning {shp_dir} for shapefiles...")
-                shp_files = list(shp_dir.glob('*.shp'))
-                logger.info(f"Found {len(shp_files)} shapefiles")
-                
-                for shp_path in shp_files:
-                    success, chart_id = process_shapefile(shp_path, conn, args.dry_run)
-                    if success:
-                        success_count += 1
-                    else:
-                        error_count += 1
-            else:
-                logger.warning(f"Shapefile directory does not exist: {shp_dir}")
-        
-        # Process GeoTIFF masks
-        if args.source_format in ['tif', 'both']:
-            tif_dir = args.data_dir / 'tif'
-            if tif_dir.exists():
-                logger.info(f"Scanning {tif_dir} for GeoTIFF masks...")
-                tif_files = list(tif_dir.glob('*.tif')) + list(tif_dir.glob('*.TIF'))
-                logger.info(f"Found {len(tif_files)} GeoTIFF files")
-                
-                for tif_path in tif_files:
-                    success, chart_id = process_geotiff_mask(tif_path, conn, args.dry_run)
-                    if success:
-                        success_count += 1
-                    else:
-                        error_count += 1
-            else:
-                logger.warning(f"GeoTIFF directory does not exist: {tif_dir}")
-        
-        # Print summary
-        logger.info("=" * 60)
-        logger.info("INGESTION SUMMARY")
-        logger.info("=" * 60)
-        logger.info(f"Successfully processed: {success_count}")
-        logger.info(f"Errors: {error_count}")
-        logger.info("=" * 60)
-        
+        if args.provenance in ('initial', 'both'):
+            i, s, e = scan_and_ingest_shapefiles(
+                args.initial_dir, 'initial', conn, args.dry_run
+            )
+            total_ingested += i
+            total_skipped += s
+            total_errors += e
+
+        if args.provenance in ('corrected', 'both'):
+            i, s, e = scan_and_ingest_shapefiles(
+                args.corrected_dir, 'corrected', conn, args.dry_run
+            )
+            total_ingested += i
+            total_skipped += s
+            total_errors += e
+
+        logger.info('=' * 60)
+        logger.info('INGESTION SUMMARY')
+        logger.info('=' * 60)
+        logger.info(f'  Ingested : {total_ingested}')
+        logger.info(f'  Skipped  : {total_skipped}')
+        logger.info(f'  Errors   : {total_errors}')
+        logger.info('=' * 60)
+
     finally:
         conn.close()
         logger.info("Database connection closed")

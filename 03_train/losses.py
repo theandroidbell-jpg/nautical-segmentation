@@ -5,6 +5,8 @@ Combined loss functions for semantic segmentation:
 - Dice Loss for handling class imbalance
 - Cross Entropy Loss for pixel-wise classification
 - Combined Dice + CrossEntropy Loss
+- DifferenceWeightedLoss: upweights pixels in the boundary/difference region
+  where the initial and corrected shapefiles diverge
 """
 
 import torch
@@ -112,7 +114,7 @@ class CombinedLoss(nn.Module):
 
 def get_loss_function(
     loss_type: str = 'combined',
-    num_classes: int = 3,
+    num_classes: int = 17,
     class_weights: torch.Tensor = None,
     dice_weight: float = 0.5,
     ce_weight: float = 0.5,
@@ -121,7 +123,8 @@ def get_loss_function(
     Factory for segmentation loss functions.
 
     Args:
-        loss_type: One of ``'combined'``, ``'dice'``, or ``'ce'``.
+        loss_type: One of ``'combined'``, ``'dice'``, ``'ce'``, or
+            ``'diff_weighted'``.
         num_classes: Number of segmentation classes.
         class_weights: Optional per-class weights for CrossEntropy.
         dice_weight: Dice component weight (only used when loss_type='combined').
@@ -144,6 +147,97 @@ def get_loss_function(
     elif loss_type == 'dice':
         return DiceLoss(num_classes=num_classes)
     elif loss_type == 'ce':
-        return nn.CrossEntropyLoss(weight=class_weights)
+        return nn.CrossEntropyLoss(weight=class_weights, ignore_index=-100)
+    elif loss_type == 'diff_weighted':
+        return DifferenceWeightedLoss(
+            num_classes=num_classes,
+            class_weights=class_weights,
+        )
     else:
-        raise ValueError(f"Unknown loss_type '{loss_type}'. Choose from: 'combined', 'dice', 'ce'.")
+        raise ValueError(
+            f"Unknown loss_type '{loss_type}'. "
+            "Choose from: 'combined', 'dice', 'ce', 'diff_weighted'."
+        )
+
+
+class DifferenceWeightedLoss(nn.Module):
+    """
+    Difference-weighted combined loss.
+
+    Upweights pixels in the boundary/difference region (where the initial
+    shapefile classification and the corrected target differ).  The weight
+    for boundary pixels is *boundary_weight*; all other pixels get weight 1.
+
+    The base loss is CombinedLoss (Dice + CrossEntropy).  The pixel-level
+    CrossEntropy component is scaled by the weight map before reduction.
+
+    This is the recommended loss for training the refinement model.
+
+    Args:
+        num_classes: Number of segmentation classes.
+        class_weights: Optional per-class weights tensor.
+        boundary_weight: Weight applied to pixels in the difference region.
+        dice_weight: Weight for the Dice component.
+        ce_weight: Weight for the CrossEntropy component.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 17,
+        class_weights: torch.Tensor = None,
+        boundary_weight: float = 5.0,
+        dice_weight: float = 0.5,
+        ce_weight: float = 0.5,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.boundary_weight = boundary_weight
+        self.dice_weight = dice_weight
+        self.ce_weight = ce_weight
+        self.dice_loss = DiceLoss(num_classes=num_classes)
+        self.class_weights = class_weights
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        diff_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Compute difference-weighted combined loss.
+
+        Args:
+            predictions: Raw logits, shape (B, C, H, W).
+            targets: Integer class labels, shape (B, H, W).
+            diff_mask: Binary difference mask, shape (B, H, W), dtype float32.
+                1 where initial ≠ corrected (boundary region), 0 elsewhere.
+                If None, falls back to uniform weighting.
+
+        Returns:
+            Scalar loss value.
+        """
+        # Dice component (global)
+        dice = self.dice_loss(predictions, targets)
+
+        # Per-pixel CrossEntropy
+        ce_unreduced = F.cross_entropy(
+            predictions,
+            targets,
+            weight=self.class_weights.to(predictions.device) if self.class_weights is not None else None,
+            ignore_index=-100,
+            reduction='none',
+        )  # (B, H, W)
+
+        # Build pixel weight map
+        if diff_mask is not None:
+            pixel_weights = 1.0 + (self.boundary_weight - 1.0) * diff_mask.float()
+        else:
+            pixel_weights = torch.ones_like(ce_unreduced)
+
+        # Weighted mean (only over non-ignored pixels)
+        valid = targets != -100
+        if valid.any():
+            ce = (ce_unreduced * pixel_weights)[valid].mean()
+        else:
+            ce = ce_unreduced.mean()
+
+        return self.dice_weight * dice + self.ce_weight * ce
