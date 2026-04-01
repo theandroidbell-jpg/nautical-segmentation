@@ -227,8 +227,8 @@ Based on manual correction patterns identified in field use:
 
 ## Notes on Chart Sources
 
-| Origin | Format | Colour Mode |
-|--------|--------|-------------|
+| Origin | Format | Color Mode |
+|--------|--------|------------|
 | UKHO | RGB TIF | rgb |
 | SHOM | RGB TIF | rgb |
 | BSH | Paletted TIF | paletted |

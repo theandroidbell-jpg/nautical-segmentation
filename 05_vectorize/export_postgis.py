@@ -74,14 +74,15 @@ def insert_prediction_polygon(
 ) -> bool:
     """Insert a single prediction polygon into dev_rcxl.predicted_polygons.
 
-    The polygon is first reprojected to EPSG:4326 for storage.
+    The polygon must already be in EPSG:4326 (reprojection is handled by
+    the calling function ``export_to_postgis``).
 
     Args:
         conn: Database connection.
         chart_id: Chart ID.
         model_version: Model version string.
         native_code: Native classification code.
-        mp: MultiPolygon geometry in the chart's native CRS.
+        mp: MultiPolygon geometry already in EPSG:4326.
         confidence_mean: Mean confidence score (optional).
         simplify_tolerance: Simplification tolerance that was applied.
 
@@ -89,22 +90,16 @@ def insert_prediction_polygon(
         True on success, False on failure.
     """
     code_name = Config.SHAPEFILE_CODE_NAMES.get(native_code, str(native_code))
-    pixel_area = int(mp.area * 1e10)  # rough estimate in degrees²
+    mp_wkt = mp.wkt
 
     try:
-        import geopandas as gpd
-        # mp is in chart's native CRS — reproject to EPSG:4326 for storage
-        gdf = gpd.GeoDataFrame({'geometry': [mp]}, crs=None)
-        # CRS is set externally before calling this function
-        mp_wkt = mp.wkt
-
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO dev_rcxl.predicted_polygons
                     (chart_id, model_version, native_code, code_name,
-                     confidence_mean, geom, pixel_area, simplify_tolerance)
-                VALUES (%s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s)
+                     confidence_mean, geom, simplify_tolerance)
+                VALUES (%s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s)
                 """,
                 (
                     chart_id,
@@ -113,7 +108,6 @@ def insert_prediction_polygon(
                     code_name,
                     confidence_mean,
                     mp_wkt,
-                    pixel_area,
                     simplify_tolerance,
                 )
             )
