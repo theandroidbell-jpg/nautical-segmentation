@@ -8,6 +8,8 @@ TIF+TFW (world file) georeferencing.
 Features:
 - Recursive directory scanning
 - Automatic CRS detection and bbox reprojection to EPSG:4326
+- Colour-mode detection (paletted vs RGB) for preprocessing stage
+- Preprocessed path registration
 - Simple border detection heuristic
 - Duplicate handling with ON CONFLICT
 - Comprehensive logging to both console and database
@@ -30,6 +32,10 @@ from psycopg2.extras import execute_values
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config
+
+# Import colour-mode detection from preprocessing stage
+sys.path.insert(0, str(Path(__file__).parent.parent / '00_preprocess'))
+from convert_palette import detect_color_mode
 
 
 # Configure logging
@@ -130,22 +136,32 @@ def extract_chart_metadata(tif_path: Path, origin: str) -> Optional[dict]:
             
             # Detect border
             has_border = detect_border(dataset, Config.BORDER_SAMPLE_SIZE, Config.BORDER_THRESHOLD)
-            
-            metadata = {
-                'filename': tif_path.name,
-                'source_path': str(tif_path.absolute()),
-                'crs_epsg': crs.to_epsg() or 0,
-                'pixel_width': width,
-                'pixel_height': height,
-                'resolution_x': resolution_x,
-                'resolution_y': resolution_y,
-                'bbox_wkt': bbox_wkt,
-                'has_border': has_border,
-                'origin': origin.upper()
-            }
-            
-            return metadata
-            
+
+        # Detect colour mode (requires a separate open so the dataset is closed)
+        color_mode = detect_color_mode(tif_path)
+
+        # Derive the expected preprocessed path
+        preprocessed_path = str(
+            Config.CHARTS_PREPROCESSED_BASE / origin.lower() / tif_path.name
+        )
+
+        metadata = {
+            'filename': tif_path.name,
+            'source_path': str(tif_path.absolute()),
+            'preprocessed_path': preprocessed_path,
+            'color_mode': color_mode,
+            'crs_epsg': crs.to_epsg() or 0,
+            'pixel_width': width,
+            'pixel_height': height,
+            'resolution_x': resolution_x,
+            'resolution_y': resolution_y,
+            'bbox_wkt': bbox_wkt,
+            'has_border': has_border,
+            'origin': origin.upper()
+        }
+        
+        return metadata
+        
     except Exception as e:
         logger.error(f"Failed to extract metadata from {tif_path.name}: {e}")
         return None
@@ -166,9 +182,10 @@ def insert_chart(conn, metadata: dict) -> Tuple[bool, Optional[int]]:
         with conn.cursor() as cur:
             insert_sql = """
                 INSERT INTO dev_rcxl.charts 
-                (filename, source_path, crs_epsg, pixel_width, pixel_height, 
+                (filename, source_path, preprocessed_path, color_mode,
+                 crs_epsg, pixel_width, pixel_height, 
                  resolution_x, resolution_y, bbox, has_border, origin, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s, 'pending')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s, 'pending')
                 ON CONFLICT (filename) DO NOTHING
                 RETURNING chart_id
             """
@@ -176,6 +193,8 @@ def insert_chart(conn, metadata: dict) -> Tuple[bool, Optional[int]]:
             cur.execute(insert_sql, (
                 metadata['filename'],
                 metadata['source_path'],
+                metadata.get('preprocessed_path'),
+                metadata.get('color_mode', 'rgb'),
                 metadata['crs_epsg'],
                 metadata['pixel_width'],
                 metadata['pixel_height'],
@@ -279,7 +298,7 @@ def scan_charts(data_dir: Path, origin: str, conn, dry_run: bool = False) -> Tup
             logger.info(f"Processing: {tif_path.name}")
             
             if dry_run:
-                logger.info(f"[DRY RUN] Would insert: {metadata['filename']}")
+                logger.info(f"[DRY RUN] Would insert: {metadata['filename']} [{metadata.get('color_mode', 'rgb')}]")
                 ingested += 1
             else:
                 # Insert into database
@@ -288,7 +307,7 @@ def scan_charts(data_dir: Path, origin: str, conn, dry_run: bool = False) -> Tup
                 duration = time.time() - start_time
                 
                 if success:
-                    logger.info(f"Inserted chart {metadata['filename']} (ID: {chart_id})")
+                    logger.info(f"Inserted chart {metadata['filename']} [{metadata.get('color_mode', 'rgb')}] (ID: {chart_id})")
                     log_processing(conn, chart_id, 'ingest', 'success', 
                                  f"Ingested from {metadata['source_path']}", duration)
                     ingested += 1
