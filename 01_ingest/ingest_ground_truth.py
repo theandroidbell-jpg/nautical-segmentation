@@ -185,7 +185,10 @@ def insert_ground_truth_polygon(
         True on success, False on failure
     """
     code_name = Config.SHAPEFILE_CODE_NAMES.get(native_code, str(native_code))
-    pixel_area = int(multipolygon.area * 1e10)
+    # Scale area to integer, capped to avoid PostgreSQL bigint overflow
+    PG_BIGINT_MAX = 9_223_372_036_854_775_807
+    raw_area = multipolygon.area * 1e6  # square degrees × 1e6
+    pixel_area = min(int(raw_area), PG_BIGINT_MAX)
 
     try:
         with conn.cursor() as cur:
@@ -316,6 +319,14 @@ def process_shapefile(
             for code, geoms in sorted(code_to_geoms.items())
         }
         logger.info(f"  Codes: {code_summary}")
+
+        # Warn about any codes outside the known set
+        known_codes = set(Config.SHAPEFILE_CODE_NAMES.keys())
+        unknown_codes = set(code_to_geoms.keys()) - known_codes
+        if unknown_codes:
+            logger.warning(
+                f"  Unknown classification codes found: {sorted(unknown_codes)} — will ingest with numeric name"
+            )
 
         # Delete existing ground_truth rows for this chart+provenance before re-inserting
         if not dry_run:
