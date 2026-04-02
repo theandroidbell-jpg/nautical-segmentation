@@ -32,7 +32,7 @@ class TestConfigDefaults:
         assert Config.TILE_SIZE == 256
         assert Config.OVERLAP == 32
         assert Config.BATCH_SIZE == 8
-        assert Config.NUM_CLASSES == 17
+        assert Config.NUM_CLASSES == 18
         assert Config.IN_CHANNELS == 4
         assert Config.LEARNING_RATE == 1e-4
         assert Config.EPOCHS == 50
