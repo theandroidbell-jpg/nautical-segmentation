@@ -317,6 +317,21 @@ def process_shapefile(
         }
         logger.info(f"  Codes: {code_summary}")
 
+        # BSH simple format detection and remapping
+        codes_present = set(code_to_geoms.keys())
+        if 230 in codes_present:
+            if codes_present == {0, 230}:
+                # Pure BSH simple format: 0=Sea, 230=everything else
+                logger.info("  BSH simple format detected — remapping code 0 → 20 (Sea Areas)")
+                code_to_geoms[20] = code_to_geoms.pop(0)
+            else:
+                # Code 230 present but with other codes — ambiguous
+                other_codes = codes_present - {230}
+                logger.warning(
+                    f"  Code 230 found alongside codes {sorted(other_codes)} — "
+                    f"BSH format ambiguous, no remapping applied. Manual review recommended."
+                )
+
         # Delete existing ground_truth rows for this chart+provenance before re-inserting
         if not dry_run:
             try:
