@@ -26,6 +26,7 @@ import numpy as np
 import rasterio
 from rasterio.features import rasterize
 from shapely import wkt
+import geopandas as gpd
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -217,6 +218,58 @@ def rasterize_ground_truth(
     return mask
 
 
+def rasterize_extents(
+    rows: List[Tuple[int, str]],
+    height: int,
+    width: int,
+    transform,
+    crs,
+) -> np.ndarray:
+    """Rasterize only code 0 (Extents) polygons as a binary mask.
+
+    Returns a uint8 array: 1 inside the chart Extents polygon, 0 outside.
+    Only uses polygons with native_code == 0. If no code 0 polygon exists,
+    returns an all-zeros array and logs a warning.
+
+    Args:
+        rows: List of (native_code, geom_wkt) from the database (EPSG:4326).
+        height: Output raster height.
+        width: Output raster width.
+        transform: Affine transform matching the source chart.
+        crs: CRS of the source chart.
+
+    Returns:
+        uint8 ndarray of shape (height, width), 1 inside extents, 0 outside.
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    extents_rows = [(code, geom_wkt) for code, geom_wkt in rows if code == 0]
+
+    if not extents_rows:
+        logger.warning("  No code 0 (Extents) polygon found — extents mask will be all zeros")
+        return mask
+
+    need_reproject = crs and crs.to_epsg() != 4326
+
+    for native_code, geom_wkt in extents_rows:
+        geom = wkt.loads(geom_wkt)
+        if geom is None or geom.is_empty:
+            continue
+        if need_reproject:
+            gdf = gpd.GeoDataFrame({'geometry': [geom]}, crs='EPSG:4326')
+            geom = gdf.to_crs(crs).geometry.iloc[0]
+        burned = rasterize(
+            [(geom, 1)],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=False,
+        )
+        mask = np.maximum(mask, burned)
+
+    return mask
+
+
 def save_mask(
     mask: np.ndarray,
     output_path: Path,
@@ -253,9 +306,10 @@ def create_masks_for_chart(
     initial_dir: Path,
     corrected_dir: Path,
     diff_dir: Path,
+    extents_dir: Path,
     overwrite: bool = False,
 ) -> bool:
-    """Create initial, corrected, and difference masks for a single chart.
+    """Create initial, corrected, difference, and extents masks for a single chart.
 
     Args:
         conn: Database connection
@@ -263,6 +317,7 @@ def create_masks_for_chart(
         initial_dir: Output directory for initial masks
         corrected_dir: Output directory for corrected masks
         diff_dir: Output directory for difference masks
+        extents_dir: Output directory for extents masks
         overwrite: Overwrite existing masks
 
     Returns:
@@ -279,12 +334,14 @@ def create_masks_for_chart(
     initial_path = initial_dir / f"{stem}_initial_mask.tif"
     corrected_path = corrected_dir / f"{stem}_corrected_mask.tif"
     diff_path = diff_dir / f"{stem}_diff_mask.tif"
+    extents_path = extents_dir / f"{stem}_extents_mask.tif"
 
     # Skip if all outputs exist and not overwriting
     if (
         initial_path.exists()
         and corrected_path.exists()
         and diff_path.exists()
+        and extents_path.exists()
         and not overwrite
     ):
         logger.info(f"All masks exist for chart {chart_id}, skipping")
@@ -317,6 +374,7 @@ def create_masks_for_chart(
 
     # Rasterize
     initial_mask = rasterize_ground_truth(initial_rows, height, width, transform, crs)
+    extents_mask = rasterize_extents(initial_rows, height, width, transform, crs)
     corrected_mask = rasterize_ground_truth(corrected_rows, height, width, transform, crs)
 
     # Difference mask: 1 where initial ≠ corrected (both must be annotated)
@@ -325,11 +383,16 @@ def create_masks_for_chart(
     diff_mask[annotated & (initial_mask != corrected_mask)] = 1
 
     # Save masks
-    if initial_rows and not initial_path.exists() or overwrite:
+    if initial_rows and (not initial_path.exists() or overwrite):
         save_mask(initial_mask, initial_path, height, width, transform, crs)
         logger.info(f"  Saved initial mask: {initial_path.name}")
 
-    if corrected_rows and not corrected_path.exists() or overwrite:
+    if initial_rows and (not extents_path.exists() or overwrite):
+        save_mask(extents_mask, extents_path, height, width, transform, crs, nodata=0)
+        extents_pct = extents_mask.sum() / max(height * width, 1) * 100
+        logger.info(f"  Saved extents mask: {extents_path.name} ({extents_pct:.1f}% of image)")
+
+    if corrected_rows and (not corrected_path.exists() or overwrite):
         save_mask(corrected_mask, corrected_path, height, width, transform, crs)
         logger.info(f"  Saved corrected mask: {corrected_path.name}")
         diff_pct = diff_mask.sum() / max(annotated.sum(), 1) * 100
@@ -377,6 +440,11 @@ def main():
         default=Config.OUTPUT_DIFF_MASKS,
         help='Output directory for difference masks',
     )
+    parser.add_argument(
+        '--extents-dir', type=Path,
+        default=Config.OUTPUT_EXTENTS_MASKS,
+        help='Output directory for extents masks',
+    )
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
@@ -384,7 +452,7 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    for d in (args.initial_dir, args.corrected_dir, args.diff_dir):
+    for d in (args.initial_dir, args.corrected_dir, args.diff_dir, args.extents_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -411,6 +479,7 @@ def main():
                 args.initial_dir,
                 args.corrected_dir,
                 args.diff_dir,
+                args.extents_dir,
                 args.overwrite,
             )
             if ok:

@@ -71,12 +71,14 @@ class Config:
     OUTPUT_INITIAL_MASKS: Path = OUTPUT_BASE / 'initial_masks'
     OUTPUT_CORRECTED_MASKS: Path = OUTPUT_BASE / 'corrected_masks'
     OUTPUT_DIFF_MASKS: Path = OUTPUT_BASE / 'diff_masks'
+    OUTPUT_EXTENTS_MASKS: Path = OUTPUT_BASE / 'extents_masks'
     OUTPUT_TRANSPARENT_SOURCE: Path = OUTPUT_BASE / 'transparent_source'
     OUTPUT_TRANSPARENT_3857: Path = OUTPUT_BASE / 'transparent_3857'
     OUTPUT_TRANSPARENT_3395: Path = OUTPUT_BASE / 'transparent_3395'
     OUTPUT_TILES: Path = OUTPUT_BASE / 'tiles'
     OUTPUT_PREDICTIONS: Path = OUTPUT_BASE / 'predictions'
     OUTPUT_VECTORS: Path = OUTPUT_BASE / 'vectors'
+    TILE_MIN_COVERAGE: float = 0.10  # Minimum fraction of tile area inside chart extents
 
     # Model storage
     MODELS_DIR: Path = Path(__file__).parent / 'models'
@@ -333,6 +335,7 @@ class Config:
             cls.OUTPUT_INITIAL_MASKS,
             cls.OUTPUT_CORRECTED_MASKS,
             cls.OUTPUT_DIFF_MASKS,
+            cls.OUTPUT_EXTENTS_MASKS,
             cls.OUTPUT_TRANSPARENT_SOURCE,
             cls.OUTPUT_TRANSPARENT_3857,
             cls.OUTPUT_TRANSPARENT_3395,
