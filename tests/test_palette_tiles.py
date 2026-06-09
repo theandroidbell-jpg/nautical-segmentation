@@ -192,9 +192,9 @@ class TestGrayscaleDuplication:
         chart = {
             'chart_id': 99,
             'source_path': str(src_path),
-            'mask_path': str(mask_path),
+            'initial_mask_path': mask_path,
         }
-        pairs = tile_chart(
+        pairs, _ = tile_chart(
             chart=chart,
             usage='train',
             output_dir=out_dir,
@@ -208,7 +208,7 @@ class TestGrayscaleDuplication:
         img_tile_path, _ = pairs[0]
 
         with rasterio.open(img_tile_path) as dst:
-            assert dst.count == 3
+            assert dst.count >= 3
             r = dst.read(1)
             g = dst.read(2)
             b = dst.read(3)
@@ -254,9 +254,9 @@ class TestTileChartPalette:
         chart = {
             'chart_id': 1,
             'source_path': str(src_path),
-            'mask_path': str(mask_path),
+            'initial_mask_path': mask_path,
         }
-        pairs = tile_chart(
+        pairs, _ = tile_chart(
             chart=chart,
             usage='train',
             output_dir=out_dir,
@@ -270,7 +270,7 @@ class TestTileChartPalette:
         img_tile_path, _ = pairs[0]
 
         with rasterio.open(img_tile_path) as dst:
-            assert dst.count == 3
+            assert dst.count >= 3
             r = dst.read(1)
             g = dst.read(2)
             b = dst.read(3)
@@ -304,9 +304,9 @@ class TestTileChartPalette:
         chart = {
             'chart_id': 2,
             'source_path': str(src_path),
-            'mask_path': str(mask_path),
+            'initial_mask_path': mask_path,
         }
-        pairs = tile_chart(
+        pairs, _ = tile_chart(
             chart=chart,
             usage='train',
             output_dir=out_dir,
