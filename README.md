@@ -121,7 +121,7 @@ export DB_NAME='mapping'
 psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f sql/schema.sql
 ```
 
-## Running the Pipeline
+## Running the Pipeline (Sprints 1 & 2)
 
 ### 1. Preprocessing (palette → RGB + CRS validation)
 
@@ -140,8 +140,30 @@ python 00_preprocess/normalize_crs.py \
 
 ### 2. Ingestion
 
+Create the required directory structure:
+
 ```bash
-# Register charts in database
+mkdir -p /data/charts/originals/{ukho,shom,bsh}
+mkdir -p /data/charts/ground_truth/{shp,tif}
+mkdir -p /data/output/{masks,transparent_source,transparent_3857,transparent_3395,tiles}
+```
+
+Place your chart TIFFs in the appropriate origin subdirectories:
+- `/data/charts/originals/ukho/` - UK Hydrographic Office charts
+- `/data/charts/originals/shom/` - French SHOM charts
+- `/data/charts/originals/bsh/` - German BSH charts
+
+Place ground truth data:
+- `/data/charts/ground_truth/shp/` - Shapefiles with classification codes
+- `/data/charts/ground_truth/tif/` - RGBA GeoTIFF masks (alpha=0 for land)
+
+Scan and register chart TIFFs and ground truth in the database:
+
+```bash
+# Ingest all charts from all origins
+python 01_ingest/ingest_charts.py --origin all
+
+# Ingest only UKHO charts
 python 01_ingest/ingest_charts.py --origin ukho
 
 # Ingest shapefiles (training: both initial and corrected)
@@ -161,7 +183,73 @@ python 02_prepare/create_masks.py --all
 python 02_prepare/create_tiles.py --all --output-dir /data/output/tiles
 ```
 
-### 4. Training
+### 4. Create Tiles
+
+Slice each chart and its mask into 256×256 pixel tiles with 32px overlap. Tiles are
+written to `train/` and `val/` subdirectories using a reproducible 80/20 chart-level
+split (all tiles from a chart stay in one split):
+
+```bash
+# Tile all charts that have a mask (recommended first run)
+python 02_prepare/create_tiles.py --all --overwrite --verbose
+
+# Tile a single chart
+python 02_prepare/create_tiles.py --chart-id 42 --overwrite --verbose
+
+# Dry run – count tiles without writing files
+python 02_prepare/create_tiles.py --all --dry-run --verbose
+```
+
+Tiles are written to `/data/output/tiles/` in the following layout:
+```
+/data/output/tiles/
+  train/{chart_id}_{col}_{row}.tif        # 3-band RGB image tile
+  train/{chart_id}_{col}_{row}_mask.tif   # single-band class mask (0/1/2)
+  val/{chart_id}_{col}_{row}.tif
+  val/{chart_id}_{col}_{row}_mask.tif
+```
+
+Tile metadata (chart_id, tile_x, tile_y, usage) is registered in
+`dev_rcxl.tiles` so you can query the split at any time.
+
+### 5. Verify Data Pipeline
+
+Once tiles exist, run the DataLoader smoke-test to confirm the PyTorch data
+pipeline is working end-to-end:
+
+```bash
+python 02_prepare/dataloader.py
+```
+
+Expected output:
+```
+Tile base directory: /data/output/tiles
+Train dataset size : <N>
+Val dataset size   : <M>
+Loading one training batch … OK  images=(8, 3, 256, 256), masks=(8, 256, 256)
+Loading one validation batch … OK  images=(8, 3, 256, 256), masks=(8, 256, 256)
+Smoke-test passed ✓
+```
+
+The `NauticalTileDataset` class (in `02_prepare/dataset.py`) can also be used
+directly in custom training scripts:
+
+```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/path/to/nautical-segmentation/02_prepare')
+from dataset import NauticalTileDataset
+from dataloader import get_dataloaders
+
+train_loader, val_loader = get_dataloaders(Path('/data/output/tiles'))
+for images, masks in train_loader:
+    # images: (B, 3, 256, 256) float32 in [0, 1]
+    # masks:  (B, 256, 256)    int64  (0=sea, 1=land, 2=exclude)
+    ...
+```
+
+### 6. Training
 
 ```bash
 python 03_train/train.py \
@@ -171,7 +259,7 @@ python 03_train/train.py \
     --loss diff_weighted
 ```
 
-### 5. Prediction
+### 7. Prediction
 
 ```bash
 python 04_predict/predict.py \
@@ -181,7 +269,7 @@ python 04_predict/predict.py \
     --checkpoint models/best_model.pth
 ```
 
-### 6. Vectorization → PostGIS
+### 8. Vectorization → PostGIS
 
 ```bash
 python 05_vectorize/export_postgis.py \
@@ -191,7 +279,7 @@ python 05_vectorize/export_postgis.py \
     --output-shp /data/output/vectors/chart_pred.shp
 ```
 
-### 7. Export transparent GeoTIFFs
+### 9. Export transparent GeoTIFFs
 
 ```bash
 # Apply transparency (sea opaque, everything else transparent)
@@ -204,6 +292,22 @@ python 06_export/apply_transparency.py \
 python 06_export/reproject.py \
     --input /data/output/transparent_source/chart_transparent.tif
 ```
+
+## Sprint Roadmap
+
+### ✅ Sprint 1 (Complete)
+- [x] Project structure and configuration
+- [x] PostGIS schema design
+- [x] Chart ingestion from TIF files
+- [x] Ground truth ingestion (shapefiles + GeoTIFF masks)
+- [x] Raster mask creation
+- [x] Database setup utilities
+
+### ✅ Sprint 2 (Complete)
+- [x] Tile dataset creation (256×256 patches with 32px overlap)
+- [x] Train/validation split (chart-level, 80/20, reproducible seed)
+- [x] PyTorch Dataset class (`NauticalTileDataset` in `02_prepare/dataset.py`)
+- [x] Data loading pipeline (`get_dataloaders` in `02_prepare/dataloader.py`)
 
 ## Testing
 
