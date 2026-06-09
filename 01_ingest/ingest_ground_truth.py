@@ -185,7 +185,9 @@ def insert_ground_truth_polygon(
         True on success, False on failure
     """
     code_name = Config.SHAPEFILE_CODE_NAMES.get(native_code, str(native_code))
-    # Scale area to integer, capped to avoid PostgreSQL bigint overflow
+    # Scale area to integer, capped to avoid PostgreSQL bigint overflow.
+    # Geometries are in EPSG:4326 (degrees); multiplying by 1e10 overflows
+    # for large polygons (e.g. Sea Areas spanning several degrees).
     PG_BIGINT_MAX = 9_223_372_036_854_775_807
     raw_area = multipolygon.area * 1e6  # square degrees × 1e6
     pixel_area = min(int(raw_area), PG_BIGINT_MAX)
@@ -320,7 +322,12 @@ def process_shapefile(
         }
         logger.info(f"  Codes: {code_summary}")
 
-        # BSH simple format detection and remapping
+        # BSH simple format detection and remapping.
+        # BSH shapefiles use two incompatible conventions:
+        #   Full UKHO-style: 0=Extents, 10=Land, 20=Sea, etc.
+        #   BSH simple:      0=Sea, 230=everything else (exclude)
+        # When only {0, 230} are present it is unambiguously BSH simple —
+        # remap 0 → 20 (Sea Areas) so the model sees a consistent label.
         codes_present = set(code_to_geoms.keys())
         if 230 in codes_present:
             if codes_present == {0, 230}:
@@ -335,12 +342,13 @@ def process_shapefile(
                     f"BSH format ambiguous, no remapping applied. Manual review recommended."
                 )
 
-        # Warn about any codes outside the known set
+        # Warn about any codes outside the known set so the operator is alerted.
         known_codes = set(Config.SHAPEFILE_CODE_NAMES.keys())
         unknown_codes = set(code_to_geoms.keys()) - known_codes
         if unknown_codes:
             logger.warning(
-                f"  Unknown classification codes found: {sorted(unknown_codes)} — will ingest with numeric name"
+                f"  Unknown classification codes found: {sorted(unknown_codes)} — "
+                f"will ingest with numeric name"
             )
 
         # Delete existing ground_truth rows for this chart+provenance before re-inserting
