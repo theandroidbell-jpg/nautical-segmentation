@@ -6,10 +6,13 @@ Provides NauticalTileDataset, a torch.utils.data.Dataset that loads pre-tiled
 256x256 chart image patches and their corresponding mask patches on-the-fly.
 
 Each tile directory is expected to contain pairs of files:
-  {stem}.tif        -- 3-band RGB image tile (uint8)
-  {stem}_mask.tif   -- single-band class mask tile (uint8, values 0/1/2)
+  {stem}.tif        -- 4-band image tile (uint8): bands 1-3 = RGB, band 4 = initial classification
+  {stem}_mask.tif   -- single-band corrected class mask tile (uint8, values 0-16 or 255=nodata)
 
-Images are normalised to float32 [0, 1]; masks are cast to int64.
+Images are normalised to float32 [0, 1] for RGB bands; the initial classification
+channel (band 4) is kept as float32 class indices (nodata=255 → -1 sentinel).
+Masks are cast to int64; nodata pixels (255) are replaced with -100 (ignore_index
+for CrossEntropyLoss).
 """
 
 from pathlib import Path
@@ -22,6 +25,12 @@ import rasterio
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import Config
+
+# Nodata value used in mask tiles
+MASK_NODATA = 255
+# PyTorch CrossEntropyLoss ignore_index
+IGNORE_INDEX = -100
 
 
 class NauticalTileDataset(Dataset):
@@ -31,29 +40,33 @@ class NauticalTileDataset(Dataset):
     ``_mask.tif``) and pairs each one with its corresponding mask tile
     (``{stem}_mask.tif``).
 
+    Returns 4-channel image tensors:
+      * Bands 1-3 (channels 0-2): RGB normalised to [0, 1] float32
+      * Band 4 (channel 3): initial classification index as float32
+        (nodata pixels → -1.0 as a sentinel)
+
+    Mask tensors use IGNORE_INDEX (-100) for nodata pixels so that
+    CrossEntropyLoss ignores them during training.
+
     Args:
         tile_dir: Directory containing ``.tif`` image tiles and their masks.
         transform: Optional callable applied to the image tensor after
             normalisation.  Receives a ``torch.Tensor`` of shape
-            ``(3, H, W)`` float32 and must return a tensor of the same shape.
+            ``(4, H, W)`` float32 and must return a tensor of the same shape.
         target_transform: Optional callable applied to the mask tensor.
             Receives a ``torch.Tensor`` of shape ``(H, W)`` int64.
-        joint_transform: Optional callable applied to BOTH the image and mask
-            tensors (after tensor conversion, before individual transforms).
+        joint_transform: Optional callable applied to BOTH tensors.
             Signature: ``(image: Tensor, mask: Tensor) -> (Tensor, Tensor)``.
-            Use this for augmentations that must be applied identically to
-            both image and mask (e.g. ``from augment import SegmentationAugmentation``).
 
     Raises:
         FileNotFoundError: If *tile_dir* does not exist.
-        FileNotFoundError: If a mask file is missing for any discovered image
-            tile.
+        FileNotFoundError: If a mask file is missing for any discovered image.
 
     Example::
 
         dataset = NauticalTileDataset(Path('/data/output/tiles/train'))
         image, mask = dataset[0]
-        # image.shape == (3, 256, 256), dtype=float32
+        # image.shape == (4, 256, 256), dtype=float32
         # mask.shape  == (256, 256),    dtype=int64
     """
 
@@ -103,26 +116,45 @@ class NauticalTileDataset(Dataset):
 
         Returns:
             Tuple ``(image, mask)`` where:
-              * ``image`` is a float32 tensor of shape ``(3, H, W)`` in [0, 1].
-              * ``mask``  is an int64  tensor of shape ``(H, W)``.
+              * ``image`` is a float32 tensor of shape ``(C, H, W)`` where
+                C = number of bands (≥ 4).  Bands 0-2 are RGB in [0, 1];
+                band 3 is the initial classification index as a float
+                (−1.0 where nodata).
+              * ``mask``  is an int64 tensor of shape ``(H, W)``.
+                Nodata pixels are set to ``IGNORE_INDEX`` (−100).
         """
         img_path = self.image_paths[idx]
         mask_path = img_path.parent / f"{img_path.stem}_mask.tif"
 
-        # Load image (exactly 3 RGB bands, normalised to [0, 1])
         with rasterio.open(img_path) as src:
-            if src.count < 3:
+            n_bands = src.count
+            if n_bands < 3:
                 raise ValueError(
-                    f"Image tile {img_path} has {src.count} band(s); expected at least 3 (RGB)."
+                    f"Image tile {img_path} has {n_bands} band(s); expected at least 3 (RGB)."
                 )
-            img_np = src.read([1, 2, 3]).astype(np.float32) / 255.0
+            # Read all bands
+            raw = src.read().astype(np.float32)  # (C, H, W)
 
-        # Load mask (band 1, cast to int64)
+        # Normalise RGB bands to [0, 1]
+        img_np = raw.copy()
+        img_np[:3] = raw[:3] / 255.0
+
+        # Handle initial classification channel (band 4, index 3)
+        if n_bands >= 4:
+            cls_channel = raw[3]
+            # Replace nodata (255) with -1 sentinel
+            cls_channel = np.where(cls_channel == MASK_NODATA, -1.0, cls_channel)
+            img_np[3] = cls_channel
+
+        # Load mask
         with rasterio.open(mask_path) as src:
             mask_np = src.read(1).astype(np.int64)
 
-        image = torch.from_numpy(img_np)   # (3, H, W) float32
-        mask = torch.from_numpy(mask_np)   # (H, W)    int64
+        # Replace nodata mask pixels with IGNORE_INDEX
+        mask_np = np.where(mask_np == MASK_NODATA, IGNORE_INDEX, mask_np)
+
+        image = torch.from_numpy(img_np)    # (C, H, W) float32
+        mask = torch.from_numpy(mask_np)    # (H, W)    int64
 
         if self.joint_transform is not None:
             image, mask = self.joint_transform(image, mask)

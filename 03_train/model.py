@@ -2,7 +2,15 @@
 U-Net Model Architecture
 
 U-Net semantic segmentation model with MobileNetV2 encoder backbone.
-Designed for 3-class segmentation (sea, land, exclude).
+Designed for multi-class segmentation using native classification codes.
+
+The model accepts 4+ input channels:
+  - Channels 0-2: RGB image
+  - Channel 3:    Rasterized initial shapefile classification (class index)
+  - Channels 4+:  Optional additional feature channels
+
+Output: one logit per native classification code (17 classes by default,
+corresponding to codes -1 and 0-20, with code -20 skipped).
 """
 
 from typing import Optional
@@ -16,6 +24,29 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config
+
+
+class _InputAdapter(nn.Module):
+    """Projects N-channel input to 3 channels expected by MobileNetV2.
+
+    When in_channels == 3 this is an identity; otherwise a learned
+    1×1 convolution maps the extra channels to the 3-channel space.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        if in_channels != 3:
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_channels, 3, kernel_size=1, bias=False),
+                nn.BatchNorm2d(3),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.proj = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
 
 
 class _DecoderBlock(nn.Module):
@@ -43,26 +74,37 @@ class UNetMobileNetV2(nn.Module):
     """
     U-Net architecture with MobileNetV2 encoder.
 
-    The encoder uses a pretrained MobileNetV2 for feature extraction,
-    and the decoder performs upsampling with skip connections.
+    Accepts ``in_channels`` input channels (default 4: RGB + initial classification).
+    When ``in_channels != 3`` an input adapter projects the extra channels to the
+    3-channel space expected by MobileNetV2.
 
-    Input:  (B, 3, 256, 256) float32
+    Input:  (B, in_channels, 256, 256) float32
     Output: (B, num_classes, 256, 256) logits
     """
 
     # MobileNetV2 encoder stage output channels
     _ENC_CHANNELS = [16, 24, 32, 96, 1280]
 
-    def __init__(self, num_classes: int = 3, pretrained: bool = True):
+    def __init__(
+        self,
+        num_classes: int = 17,
+        in_channels: int = 4,
+        pretrained: bool = True,
+    ):
         """
         Initialize U-Net model.
 
         Args:
-            num_classes: Number of output classes (default: 3)
+            num_classes: Number of output classes (default: 17)
+            in_channels: Number of input channels (default: 4 = RGB + initial cls)
             pretrained: Use pretrained MobileNetV2 weights (default: True)
         """
         super().__init__()
         self.num_classes = num_classes
+        self.in_channels = in_channels
+
+        # ── Input adapter ─────────────────────────────────────────────
+        self.input_adapter = _InputAdapter(in_channels)
 
         # ── Encoder (MobileNetV2) ──────────────────────────────────────────
         try:
@@ -99,7 +141,7 @@ class UNetMobileNetV2(nn.Module):
         self.dec2 = _DecoderBlock(64,   16,   32)  # 64→128, +e1(16)
         self.dec1 = _DecoderBlock(32,    0,   16)  # 128→256 (no skip)
 
-        # ── Segmentation head ────────────────────────────────────────────
+        # ── Segmentation head ────────────────────────────────────────
         self.head = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -107,11 +149,13 @@ class UNetMobileNetV2(nn.Module):
         Forward pass.
 
         Args:
-            x: Input tensor of shape (B, 3, H, W)
+            x: Input tensor of shape (B, in_channels, H, W)
 
         Returns:
             Logit tensor of shape (B, num_classes, H, W)
         """
+        x = self.input_adapter(x)  # → (B, 3, H, W)
+
         e1 = self.enc1(x)
         e2 = self.enc2(e1)
         e3 = self.enc3(e2)
@@ -128,7 +172,8 @@ class UNetMobileNetV2(nn.Module):
 
 
 def create_model(
-    num_classes: int = 3,
+    num_classes: int = 17,
+    in_channels: int = 4,
     pretrained: bool = True,
     device: str = 'cpu'
 ) -> UNetMobileNetV2:
@@ -136,14 +181,19 @@ def create_model(
     Create and initialize a UNetMobileNetV2 model.
 
     Args:
-        num_classes: Number of output classes (default: 3)
+        num_classes: Number of output classes (default: 17)
+        in_channels: Number of input channels (default: 4 = RGB + initial cls)
         pretrained: Use pretrained MobileNetV2 encoder weights (default: True)
         device: Device string, e.g. 'cpu' or 'cuda' (default: 'cpu')
 
     Returns:
         Initialized UNetMobileNetV2 on *device*.
     """
-    model = UNetMobileNetV2(num_classes=num_classes, pretrained=pretrained)
+    model = UNetMobileNetV2(
+        num_classes=num_classes,
+        in_channels=in_channels,
+        pretrained=pretrained,
+    )
     model = model.to(device)
     return model
 
@@ -164,7 +214,11 @@ def save_model(
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload: dict = {'state_dict': model.state_dict(), 'num_classes': model.num_classes}
+    payload: dict = {
+        'state_dict': model.state_dict(),
+        'num_classes': model.num_classes,
+        'in_channels': model.in_channels,
+    }
     if metadata:
         payload.update(metadata)
 
@@ -173,7 +227,8 @@ def save_model(
 
 def load_model(
     checkpoint_path: Path,
-    num_classes: int = 3,
+    num_classes: int = 17,
+    in_channels: int = 4,
     device: str = 'cpu'
 ) -> UNetMobileNetV2:
     """
@@ -182,6 +237,7 @@ def load_model(
     Args:
         checkpoint_path: Path to the checkpoint file produced by save_model.
         num_classes: Number of output classes (overridden by checkpoint if present).
+        in_channels: Number of input channels (overridden by checkpoint if present).
         device: Device to place the model on.
 
     Returns:
@@ -191,7 +247,8 @@ def load_model(
     payload = torch.load(checkpoint_path, map_location=device)
 
     n_cls = payload.get('num_classes', num_classes)
-    model = UNetMobileNetV2(num_classes=n_cls, pretrained=False)
+    n_ch = payload.get('in_channels', in_channels)
+    model = UNetMobileNetV2(num_classes=n_cls, in_channels=n_ch, pretrained=False)
     model.load_state_dict(payload['state_dict'])
     model = model.to(device)
     model.eval()

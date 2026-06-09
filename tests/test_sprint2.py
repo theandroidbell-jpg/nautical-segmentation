@@ -48,6 +48,8 @@ def _write_geotiff(path: Path, data: np.ndarray, is_mask: bool = False) -> None:
         'crs': 'EPSG:4326',
         'transform': from_bounds(0, 0, 1, 1, width, height),
     }
+    if is_mask:
+        profile['nodata'] = 255
     with rasterio.open(path, 'w', **profile) as dst:
         if data.ndim == 2:
             dst.write(data, 1)
@@ -56,13 +58,14 @@ def _write_geotiff(path: Path, data: np.ndarray, is_mask: bool = False) -> None:
 
 
 def _make_tile_dir(tmp_path: Path, n_tiles: int = 3) -> Path:
-    """Create a temporary tile directory with *n_tiles* image/mask pairs."""
+    """Create a temporary tile directory with *n_tiles* 4-channel image/mask pairs."""
     tile_dir = tmp_path / 'tiles'
     tile_dir.mkdir()
 
     for i in range(n_tiles):
-        img_data = np.full((3, 256, 256), i * 10, dtype=np.uint8)
-        mask_data = np.full((256, 256), i % 3, dtype=np.uint8)
+        # 4-channel image tile (RGB + initial classification)
+        img_data = np.full((4, 256, 256), i * 10, dtype=np.uint8)
+        mask_data = np.full((256, 256), i % 17, dtype=np.uint8)
         _write_geotiff(tile_dir / f'chart1_{i}_0.tif', img_data)
         _write_geotiff(tile_dir / f'chart1_{i}_0_mask.tif', mask_data, is_mask=True)
 
@@ -91,7 +94,7 @@ class TestNauticalTileDataset:
         """FileNotFoundError raised when a mask file is absent."""
         tile_dir = tmp_path / 'tiles'
         tile_dir.mkdir()
-        img_data = np.zeros((3, 256, 256), dtype=np.uint8)
+        img_data = np.zeros((4, 256, 256), dtype=np.uint8)
         _write_geotiff(tile_dir / 'chart1_0_0.tif', img_data)
         # deliberately omit mask file
         with pytest.raises(FileNotFoundError):
@@ -102,7 +105,8 @@ class TestNauticalTileDataset:
         tile_dir = _make_tile_dir(tmp_path)
         ds = NauticalTileDataset(tile_dir)
         image, mask = ds[0]
-        assert image.shape == (3, 256, 256)
+        assert image.shape[0] >= 4  # at least 4 channels (RGB + initial cls)
+        assert image.shape[1:] == (256, 256)
         assert mask.shape == (256, 256)
         assert image.dtype == torch.float32
         assert mask.dtype == torch.int64
@@ -183,7 +187,7 @@ class TestGetDataloaders:
 
         for split_dir in (train_dir, val_dir):
             for i in range(2):
-                img = np.zeros((3, 256, 256), dtype=np.uint8)
+                img = np.zeros((4, 256, 256), dtype=np.uint8)
                 msk = np.zeros((256, 256), dtype=np.uint8)
                 _write_geotiff(split_dir / f'chart_{i}_0.tif', img)
                 _write_geotiff(split_dir / f'chart_{i}_0_mask.tif', msk)
@@ -200,7 +204,7 @@ class TestGetDataloaders:
             d = tmp_path / split
             d.mkdir()
             for i in range(2):
-                _write_geotiff(d / f'c_{i}_0.tif', np.zeros((3, 256, 256), dtype=np.uint8))
+                _write_geotiff(d / f'c_{i}_0.tif', np.zeros((4, 256, 256), dtype=np.uint8))
                 _write_geotiff(d / f'c_{i}_0_mask.tif', np.zeros((256, 256), dtype=np.uint8))
 
         train_loader, val_loader = get_dataloaders(tmp_path, batch_size=2, num_workers=0)
@@ -215,12 +219,14 @@ class TestGetDataloaders:
             d = tmp_path / split
             d.mkdir()
             for i in range(4):
-                _write_geotiff(d / f'c_{i}_0.tif', np.zeros((3, 256, 256), dtype=np.uint8))
+                _write_geotiff(d / f'c_{i}_0.tif', np.zeros((4, 256, 256), dtype=np.uint8))
                 _write_geotiff(d / f'c_{i}_0_mask.tif', np.zeros((256, 256), dtype=np.uint8))
 
         train_loader, _ = get_dataloaders(tmp_path, batch_size=2, num_workers=0)
         images, masks = next(iter(train_loader))
-        assert images.shape == (2, 3, 256, 256)
+        assert images.shape[0] == 2   # batch size
+        assert images.shape[1] >= 4  # at least 4 channels
+        assert images.shape[2:] == (256, 256)
         assert masks.shape == (2, 256, 256)
 
 

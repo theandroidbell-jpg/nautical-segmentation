@@ -37,21 +37,22 @@ from train import calculate_iou, train_epoch, validate_epoch, train_model
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-NUM_CLASSES = 3
+NUM_CLASSES = 17
 BATCH = 2
 H, W = 256, 256
+IN_CHANNELS = 4  # RGB + initial classification
 
 
-def _random_batch(batch_size: int = BATCH, num_classes: int = NUM_CLASSES):
+def _random_batch(batch_size: int = BATCH, num_classes: int = NUM_CLASSES, in_channels: int = IN_CHANNELS):
     """Return a random (images, masks) batch as CPU tensors."""
-    images = torch.rand(batch_size, 3, H, W)
+    images = torch.rand(batch_size, in_channels, H, W)
     masks = torch.randint(0, num_classes, (batch_size, H, W))
     return images, masks
 
 
-def _tiny_loader(n_samples: int = 4, batch_size: int = 2, num_classes: int = NUM_CLASSES):
+def _tiny_loader(n_samples: int = 4, batch_size: int = 2, num_classes: int = NUM_CLASSES, in_channels: int = IN_CHANNELS):
     """Create a DataLoader backed by synthetic tensors."""
-    images = torch.rand(n_samples, 3, H, W)
+    images = torch.rand(n_samples, in_channels, H, W)
     masks = torch.randint(0, num_classes, (n_samples, H, W))
     dataset = TensorDataset(images, masks)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -66,7 +67,7 @@ class TestUNetMobileNetV2:
 
     def test_forward_pass_shape(self):
         """Output logits have shape (B, num_classes, H, W)."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False, device='cpu')
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False, device='cpu')
         images, _ = _random_batch()
         with torch.no_grad():
             logits = model(images)
@@ -76,27 +77,35 @@ class TestUNetMobileNetV2:
 
     def test_output_dtype(self):
         """Output is float32."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False, device='cpu')
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False, device='cpu')
         images, _ = _random_batch()
         with torch.no_grad():
             logits = model(images)
         assert logits.dtype == torch.float32
 
     def test_different_num_classes(self):
-        """Model works for num_classes != 3."""
-        model = create_model(num_classes=5, pretrained=False, device='cpu')
+        """Model works for num_classes != 17."""
+        model = create_model(num_classes=5, in_channels=IN_CHANNELS, pretrained=False, device='cpu')
         images, _ = _random_batch()
         with torch.no_grad():
             logits = model(images)
         assert logits.shape[1] == 5
 
+    def test_three_channel_input(self):
+        """Model works with 3-channel input (backward compat)."""
+        model = create_model(num_classes=NUM_CLASSES, in_channels=3, pretrained=False, device='cpu')
+        images = torch.rand(BATCH, 3, H, W)
+        with torch.no_grad():
+            logits = model(images)
+        assert logits.shape == (BATCH, NUM_CLASSES, H, W)
+
     def test_save_and_load(self, tmp_path: Path):
         """save_model / load_model round-trips produce identical outputs."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False, device='cpu')
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False, device='cpu')
         ckpt = tmp_path / 'ckpt.pth'
         save_model(model, ckpt, metadata={'epoch': 1, 'best_val_miou': 0.5})
 
-        loaded = load_model(ckpt, num_classes=NUM_CLASSES, device='cpu')
+        loaded = load_model(ckpt, num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, device='cpu')
 
         # Put both models in eval mode so BatchNorm behaves identically
         model.eval()
@@ -109,7 +118,7 @@ class TestUNetMobileNetV2:
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
         """save_model creates missing parent directories."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False, device='cpu')
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False, device='cpu')
         deep_path = tmp_path / 'a' / 'b' / 'c' / 'model.pth'
         save_model(model, deep_path)
         assert deep_path.exists()
@@ -120,7 +129,7 @@ class TestUNetMobileNetV2:
 # ---------------------------------------------------------------------------
 
 class TestLossFunctions:
-    """Tests for DiceLoss, CombinedLoss, and get_loss_function."""
+    """Tests for DiceLoss, CombinedLoss, get_loss_function, DifferenceWeightedLoss."""
 
     def test_dice_loss_finite(self):
         """DiceLoss returns a finite scalar."""
@@ -162,6 +171,12 @@ class TestLossFunctions:
         fn = get_loss_function('ce', num_classes=NUM_CLASSES)
         assert isinstance(fn, nn.CrossEntropyLoss)
 
+    def test_get_loss_function_diff_weighted(self):
+        """get_loss_function('diff_weighted') returns DifferenceWeightedLoss."""
+        from losses import DifferenceWeightedLoss
+        fn = get_loss_function('diff_weighted', num_classes=NUM_CLASSES)
+        assert isinstance(fn, DifferenceWeightedLoss)
+
     def test_get_loss_function_invalid(self):
         """get_loss_function raises ValueError for unknown type."""
         with pytest.raises(ValueError):
@@ -175,6 +190,25 @@ class TestLossFunctions:
         loss = fn(logits, masks)
         assert torch.isfinite(loss)
 
+    def test_diff_weighted_loss_without_diff_mask(self):
+        """DifferenceWeightedLoss works without diff_mask (uniform weights)."""
+        from losses import DifferenceWeightedLoss
+        fn = DifferenceWeightedLoss(num_classes=NUM_CLASSES)
+        logits = torch.randn(BATCH, NUM_CLASSES, H, W)
+        _, masks = _random_batch()
+        loss = fn(logits, masks, diff_mask=None)
+        assert torch.isfinite(loss)
+
+    def test_diff_weighted_loss_with_diff_mask(self):
+        """DifferenceWeightedLoss upweights boundary pixels."""
+        from losses import DifferenceWeightedLoss
+        fn = DifferenceWeightedLoss(num_classes=NUM_CLASSES, boundary_weight=5.0)
+        logits = torch.randn(BATCH, NUM_CLASSES, H, W)
+        _, masks = _random_batch()
+        diff_mask = torch.randint(0, 2, (BATCH, H, W)).float()
+        loss_with = fn(logits, masks, diff_mask=diff_mask)
+        assert torch.isfinite(loss_with)
+
 
 # ---------------------------------------------------------------------------
 # Augmentation tests
@@ -184,7 +218,7 @@ class TestSegmentationAugmentation:
     """Tests for SegmentationAugmentation and helper functions."""
 
     def _make_tensors(self):
-        image = torch.rand(3, H, W)
+        image = torch.rand(IN_CHANNELS, H, W)
         mask = torch.randint(0, NUM_CLASSES, (H, W))
         return image, mask
 
@@ -289,7 +323,7 @@ class TestEndToEndTraining:
 
     def test_train_epoch_metrics(self):
         """train_epoch runs without error and returns expected metric keys."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False)
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False)
         loader = _tiny_loader()
         criterion = get_loss_function('combined', num_classes=NUM_CLASSES)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
@@ -307,7 +341,7 @@ class TestEndToEndTraining:
 
     def test_validate_epoch_metrics(self):
         """validate_epoch runs without error and returns expected metric keys."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False)
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False)
         loader = _tiny_loader()
         criterion = get_loss_function('combined', num_classes=NUM_CLASSES)
 
@@ -321,7 +355,7 @@ class TestEndToEndTraining:
 
     def test_train_model_saves_checkpoint(self, tmp_path: Path):
         """train_model saves a best-model checkpoint after training."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False)
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False)
         train_loader = _tiny_loader()
         val_loader = _tiny_loader()
         criterion = get_loss_function('combined', num_classes=NUM_CLASSES)
@@ -347,9 +381,8 @@ class TestEndToEndTraining:
 
     def test_train_model_early_stopping(self, tmp_path: Path):
         """train_model terminates early when patience is exceeded."""
-        model = create_model(num_classes=NUM_CLASSES, pretrained=False)
+        model = create_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS, pretrained=False)
 
-        # Deterministic loader — mIoU should not improve after first epoch
         train_loader = _tiny_loader()
         val_loader = _tiny_loader()
         criterion = get_loss_function('combined', num_classes=NUM_CLASSES)
@@ -369,7 +402,6 @@ class TestEndToEndTraining:
             max_batches=1,
         )
 
-        # Should not have run all 20 epochs
         assert result['best_epoch'] <= 20
 
 
