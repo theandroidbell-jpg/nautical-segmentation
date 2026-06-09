@@ -1,9 +1,21 @@
 """
 Tile Creation Script
 
-Slices source chart TIFFs and their corresponding masks into 256×256 pixel tiles
-with 32px overlap. Tiles are saved to train/val subdirectories based on an 80/20
-chart-level split (all tiles from a chart go to either train or val, never both).
+Slices source chart TIFFs, initial classification masks, and corrected masks
+into 256×256 pixel tiles with 32px overlap.
+
+Tile format:
+  <OUTPUT_TILES>/train/{chart_id}_{col}_{row}.tif       — 4-band image tile
+  <OUTPUT_TILES>/train/{chart_id}_{col}_{row}_mask.tif  — corrected mask tile
+
+The image tile has 4 bands:
+  Band 1-3: RGB from preprocessed chart
+  Band 4:   Rasterized initial classification (class index 0-16, 255=nodata)
+
+The mask tile contains the corrected class indices (target for training).
+
+Tiles near the land/sea frontier (where initial ≠ corrected) are oversampled
+to focus the model's attention on difficult boundary regions.
 
 Output layout:
   <OUTPUT_TILES>/train/{chart_id}_{col}_{row}.tif
@@ -22,10 +34,14 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio
+import rasterio.enums
 from rasterio.transform import from_origin
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import Config
+
+# Fill value matching create_masks.py
+MASK_NODATA = 255
 
 
 # ---------------------------------------------------------------------------
@@ -44,20 +60,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def get_charts_with_masks(conn, mask_dir: Path) -> List[dict]:
-    """Query database for charts that have a mask file on disk.
+    """Query database for charts that have both initial and corrected mask files.
+
+    Falls back to charts that have at least an initial mask (inference mode).
 
     Args:
         conn: psycopg2 database connection
-        mask_dir: Directory containing mask files
+        mask_dir: Base output directory (parent of initial_masks/corrected_masks)
 
     Returns:
-        List of dicts with chart_id, filename, source_path
+        List of dicts with chart_id, filename, source_path, initial_mask_path,
+        corrected_mask_path (may be None), diff_mask_path (may be None)
     """
+    initial_dir = mask_dir / 'initial_masks' if (mask_dir / 'initial_masks').exists() else mask_dir
+    corrected_dir = mask_dir / 'corrected_masks' if (mask_dir / 'corrected_masks').exists() else mask_dir
+    diff_dir = mask_dir / 'diff_masks' if (mask_dir / 'diff_masks').exists() else mask_dir
+    extents_dir = mask_dir / 'extents_masks' if (mask_dir / 'extents_masks').exists() else mask_dir
+
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT chart_id, filename, source_path
+                SELECT chart_id, filename, source_path, preprocessed_path
                 FROM dev_rcxl.charts
                 ORDER BY chart_id
                 """
@@ -65,15 +89,31 @@ def get_charts_with_masks(conn, mask_dir: Path) -> List[dict]:
             rows = cur.fetchall()
 
         charts = []
-        for chart_id, filename, source_path in rows:
-            mask_path = mask_dir / (Path(filename).stem + '_mask.tif')
-            if mask_path.exists():
-                charts.append({
-                    'chart_id': chart_id,
-                    'filename': filename,
-                    'source_path': source_path,
-                    'mask_path': mask_path,
-                })
+        for chart_id, filename, source_path, preprocessed_path in rows:
+            stem = Path(filename).stem
+            initial_mask_path = initial_dir / f"{stem}_initial_mask.tif"
+            corrected_mask_path = corrected_dir / f"{stem}_corrected_mask.tif"
+            diff_mask_path = diff_dir / f"{stem}_diff_mask.tif"
+            extents_mask_path = extents_dir / f"{stem}_extents_mask.tif"
+
+            if not initial_mask_path.exists():
+                # Try legacy mask filename
+                legacy = mask_dir / f"{stem}_mask.tif"
+                if legacy.exists():
+                    initial_mask_path = legacy
+                else:
+                    continue
+
+            effective_src = preprocessed_path or source_path
+            charts.append({
+                'chart_id': chart_id,
+                'filename': filename,
+                'source_path': effective_src or source_path,
+                'initial_mask_path': initial_mask_path,
+                'corrected_mask_path': corrected_mask_path if corrected_mask_path.exists() else None,
+                'diff_mask_path': diff_mask_path if diff_mask_path.exists() else None,
+                'extents_mask_path': extents_mask_path if extents_mask_path.exists() else None,
+            })
         return charts
     except Exception as exc:
         logger.error(f"Error querying charts: {exc}")
@@ -86,7 +126,7 @@ def get_single_chart(conn, chart_id: int, mask_dir: Path) -> Optional[dict]:
     Args:
         conn: psycopg2 database connection
         chart_id: Chart ID to fetch
-        mask_dir: Directory containing mask files
+        mask_dir: Base directory containing mask subdirectories
 
     Returns:
         Chart dict or None
@@ -95,7 +135,7 @@ def get_single_chart(conn, chart_id: int, mask_dir: Path) -> Optional[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT chart_id, filename, source_path
+                SELECT chart_id, filename, source_path, preprocessed_path
                 FROM dev_rcxl.charts
                 WHERE chart_id = %s
                 """,
@@ -104,17 +144,15 @@ def get_single_chart(conn, chart_id: int, mask_dir: Path) -> Optional[dict]:
             row = cur.fetchone()
         if not row:
             return None
-        chart_id_db, filename, source_path = row
-        mask_path = mask_dir / (Path(filename).stem + '_mask.tif')
-        if not mask_path.exists():
-            logger.warning(f"Mask not found for chart {chart_id}: {mask_path}")
-            return None
-        return {
-            'chart_id': chart_id_db,
-            'filename': filename,
-            'source_path': source_path,
-            'mask_path': mask_path,
-        }
+        chart_id_db, filename, source_path, preprocessed_path = row
+        effective_src = preprocessed_path or source_path
+        # Use get_charts_with_masks logic for consistent mask lookup
+        charts = get_charts_with_masks(conn, mask_dir)
+        for c in charts:
+            if c['chart_id'] == chart_id_db:
+                return c
+        logger.warning(f"Mask not found for chart {chart_id}")
+        return None
     except Exception as exc:
         logger.error(f"Error fetching chart {chart_id}: {exc}")
         return None
@@ -238,6 +276,30 @@ def split_charts(
 # Tiling
 # ---------------------------------------------------------------------------
 
+def _palette_to_rgb(src_img: rasterio.DatasetReader, band1: np.ndarray) -> np.ndarray:
+    """Convert a paletted (indexed-colour) band to a 3-channel RGB array.
+
+    Args:
+        src_img: Open rasterio dataset with a palette on band 1.
+        band1: 2-D uint8 array of palette indices with shape (H, W).
+
+    Returns:
+        np.ndarray of shape (3, H, W) and dtype uint8 containing true RGB values.
+    """
+    colormap = src_img.colormap(1)
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for idx, rgba in colormap.items():
+        if 0 <= idx <= 255:
+            if len(rgba) >= 4:
+                lut[idx] = rgba[:4]
+            elif len(rgba) == 3:
+                lut[idx] = (*rgba, 255)
+            # entries with fewer than 3 elements are left as (0, 0, 0, 0)
+    indices = band1.astype(np.uint8)
+    rgb = lut[indices, :3]  # (H, W, 3)
+    return np.moveaxis(rgb, -1, 0)  # (3, H, W)
+
+
 def _save_tile(
     data: np.ndarray,
     output_path: Path,
@@ -277,7 +339,7 @@ def _save_tile(
         profile['transform'] = new_transform
 
     if is_mask:
-        profile.update(count=1, dtype='uint8')
+        profile.update(count=1, dtype='uint8', nodata=MASK_NODATA)
         with rasterio.open(output_path, 'w', **profile) as dst:
             dst.write(data, 1)
     else:
@@ -294,25 +356,45 @@ def tile_chart(
     overlap: int,
     overwrite: bool,
     dry_run: bool,
-) -> List[Tuple[Path, Path]]:
-    """Tile a single chart and its mask.
+    boundary_oversample: int = 2,
+) -> Tuple[List[Tuple[Path, Path]], int]:
+    """Tile a single chart into 4-channel image tiles and corrected mask tiles.
+
+    Each image tile has 4 bands:
+      Band 1-3: RGB from (preprocessed) chart
+      Band 4:   Initial classification channel (class indices 0-16, 255=nodata)
+
+    Each mask tile has 1 band: corrected class indices (training target).
+
+    Tiles that overlap the boundary/difference region (where initial ≠ corrected)
+    are duplicated *boundary_oversample* extra times with a "_bN" suffix to
+    oversample the difficult frontier during training.
+
+    Tiles whose extents mask coverage falls below Config.TILE_MIN_COVERAGE are
+    skipped entirely so that out-of-boundary areas are excluded from training.
 
     Args:
-        chart: Chart metadata dict (chart_id, source_path, mask_path)
+        chart: Chart metadata dict from get_charts_with_masks
         usage: 'train' or 'val'
         output_dir: Base output tiles directory
         tile_size: Size of each tile in pixels
         overlap: Overlap between tiles in pixels
         overwrite: Overwrite existing tiles
         dry_run: If True, calculate tiles but do not write files
+        boundary_oversample: Extra copies of boundary tiles (train only)
 
     Returns:
-        List of (image_tile_path, mask_tile_path) pairs
+        Tuple of (list of (image_tile_path, mask_tile_path) pairs, skipped_tiles count)
     """
     stride = tile_size - overlap
     chart_id = chart['chart_id']
     source_path = chart['source_path']
-    mask_path = chart['mask_path']
+    initial_mask_path = chart['initial_mask_path']
+    corrected_mask_path = chart.get('corrected_mask_path')
+    diff_mask_path = chart.get('diff_mask_path')
+
+    # Use corrected mask as training target; fall back to initial mask
+    target_mask_path = corrected_mask_path or initial_mask_path
 
     split_dir = output_dir / usage
     if not dry_run:
@@ -321,64 +403,122 @@ def tile_chart(
     created_pairs: List[Tuple[Path, Path]] = []
 
     try:
-        with rasterio.open(source_path) as src_img, rasterio.open(mask_path) as src_mask:
+        with rasterio.open(source_path) as src_img:
             img_height, img_width = src_img.height, src_img.width
             img_profile = src_img.profile
 
-            # Read available bands and convert to 3-band RGB
-            n_bands = 3
+            # Read RGB bands
             if src_img.count >= 3:
-                img_data = src_img.read([1, 2, 3])  # (3, H, W) uint8
+                rgb_data = src_img.read([1, 2, 3])  # (3, H, W) uint8
             elif src_img.count == 1:
                 logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
                 band = src_img.read(1)  # (H, W) uint8
-                img_data = np.stack([band, band, band])  # grayscale → 3-channel
+                if src_img.colorinterp[0] == rasterio.enums.ColorInterp.palette:
+                    logger.debug(f"Chart {chart_id}: paletted image detected, expanding colormap to RGB")
+                    rgb_data = _palette_to_rgb(src_img, band)
+                else:
+                    rgb_data = np.stack([band, band, band])  # grayscale → 3-channel
             else:
-                # 2-band case: duplicate first band for third channel
-                logger.debug(f"Chart {chart_id}: {src_img.count}-band image, converting to 3-band")
                 b1 = src_img.read(1)
                 b2 = src_img.read(2)
-                img_data = np.stack([b1, b2, b1])
-            mask_data = src_mask.read(1)         # (H, W) uint8
+                rgb_data = np.stack([b1, b2, b1])
+
+        # Read initial classification mask (class indices)
+        with rasterio.open(initial_mask_path) as src_init:
+            initial_cls = src_init.read(1)  # (H, W) uint8
+
+        # Read target (corrected) mask
+        with rasterio.open(target_mask_path) as src_tgt:
+            target_data = src_tgt.read(1)  # (H, W) uint8
+
+        # Read diff mask for oversampling boundary tiles
+        diff_data: Optional[np.ndarray] = None
+        if diff_mask_path and usage == 'train':
+            try:
+                with rasterio.open(diff_mask_path) as src_diff:
+                    diff_data = src_diff.read(1)
+            except Exception:
+                diff_data = None
+
+        # Load extents mask for chart boundary filtering
+        extents_data: Optional[np.ndarray] = None
+        extents_mask_path = chart.get('extents_mask_path')
+        if extents_mask_path:
+            try:
+                with rasterio.open(extents_mask_path) as src_ext:
+                    extents_data = src_ext.read(1)
+            except Exception as exc:
+                logger.warning(f"Chart {chart_id}: could not load extents mask: {exc}")
+        if extents_data is None:
+            logger.warning(f"Chart {chart_id}: no extents mask found — all tiles will be included")
 
         # Iterate over grid positions
         col = 0
         col_idx = 0
+        skipped_tiles = 0
         while col < img_width:
             row = 0
             row_idx = 0
             while row < img_height:
-                img_tile_name = f"{chart_id}_{col_idx}_{row_idx}.tif"
-                mask_tile_name = f"{chart_id}_{col_idx}_{row_idx}_mask.tif"
+                base_name = f"{chart_id}_{col_idx}_{row_idx}"
+                img_tile_name = f"{base_name}.tif"
+                mask_tile_name = f"{base_name}_mask.tif"
                 img_tile_path = split_dir / img_tile_name
                 mask_tile_path = split_dir / mask_tile_name
 
-                if not overwrite and img_tile_path.exists() and mask_tile_path.exists():
-                    created_pairs.append((img_tile_path, mask_tile_path))
-                    row += stride
-                    row_idx += 1
-                    continue
-
-                # Extract tile — may extend beyond boundary
                 col_end = col + tile_size
                 row_end = row + tile_size
-
-                img_tile = np.zeros((n_bands, tile_size, tile_size), dtype=np.uint8)
-                mask_tile = np.full((tile_size, tile_size), 2, dtype=np.uint8)  # pad = exclude
-
                 src_col_end = min(col_end, img_width)
                 src_row_end = min(row_end, img_height)
                 dst_cols = src_col_end - col
                 dst_rows = src_row_end - row
 
-                img_tile[:, :dst_rows, :dst_cols] = img_data[:, row:src_row_end, col:src_col_end]
-                mask_tile[:dst_rows, :dst_cols] = mask_data[row:src_row_end, col:src_col_end]
+                # Build 4-channel image tile (RGB + initial)
+                img_tile = np.zeros((4, tile_size, tile_size), dtype=np.uint8)
+                img_tile[:3, :dst_rows, :dst_cols] = rgb_data[:, row:src_row_end, col:src_col_end]
+                # Channel 4: initial classification (fill with MASK_NODATA)
+                init_channel = np.full((tile_size, tile_size), MASK_NODATA, dtype=np.uint8)
+                init_channel[:dst_rows, :dst_cols] = initial_cls[row:src_row_end, col:src_col_end]
+                img_tile[3] = init_channel
 
-                if not dry_run:
-                    _save_tile(img_tile, img_tile_path, img_profile, col, row, tile_size, is_mask=False)
-                    _save_tile(mask_tile, mask_tile_path, img_profile, col, row, tile_size, is_mask=True)
+                # Build mask tile (corrected, fill with MASK_NODATA)
+                mask_tile = np.full((tile_size, tile_size), MASK_NODATA, dtype=np.uint8)
+                mask_tile[:dst_rows, :dst_cols] = target_data[row:src_row_end, col:src_col_end]
 
-                created_pairs.append((img_tile_path, mask_tile_path))
+                # Extents coverage gate — skip tiles outside the chart boundary
+                skip_tile = False
+                if extents_data is not None:
+                    ext_slice = extents_data[row:src_row_end, col:src_col_end]
+                    ext_padded = np.zeros((tile_size, tile_size), dtype=np.uint8)
+                    ext_padded[:dst_rows, :dst_cols] = ext_slice
+                    coverage = float(ext_padded.sum()) / (tile_size * tile_size)
+                    if coverage < Config.TILE_MIN_COVERAGE:
+                        skip_tile = True
+                        skipped_tiles += 1
+
+                if not skip_tile:
+                    if not overwrite and img_tile_path.exists() and mask_tile_path.exists():
+                        created_pairs.append((img_tile_path, mask_tile_path))
+                    else:
+                        if not dry_run:
+                            _save_tile(img_tile, img_tile_path, img_profile, col, row, tile_size, is_mask=False)
+                            _save_tile(mask_tile, mask_tile_path, img_profile, col, row, tile_size, is_mask=True)
+                        created_pairs.append((img_tile_path, mask_tile_path))
+
+                    # Boundary oversampling (training only)
+                    if usage == 'train' and diff_data is not None and boundary_oversample > 0:
+                        tile_diff = diff_data[row:src_row_end, col:src_col_end]
+                        if tile_diff.any():
+                            for copy_idx in range(boundary_oversample):
+                                bname = f"{base_name}_b{copy_idx}"
+                                b_img_path = split_dir / f"{bname}.tif"
+                                b_mask_path = split_dir / f"{bname}_mask.tif"
+                                if not overwrite and b_img_path.exists() and b_mask_path.exists():
+                                    created_pairs.append((b_img_path, b_mask_path))
+                                elif not dry_run:
+                                    _save_tile(img_tile, b_img_path, img_profile, col, row, tile_size, is_mask=False)
+                                    _save_tile(mask_tile, b_mask_path, img_profile, col, row, tile_size, is_mask=True)
+                                    created_pairs.append((b_img_path, b_mask_path))
 
                 row += stride
                 row_idx += 1
@@ -389,7 +529,9 @@ def tile_chart(
         logger.error(f"Error tiling chart {chart_id}: {exc}")
         raise
 
-    return created_pairs
+    if skipped_tiles > 0:
+        logger.info(f"  Extents filter: skipped {skipped_tiles} out-of-boundary tiles")
+    return created_pairs, skipped_tiles
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +547,7 @@ def process_charts(
     overwrite: bool,
     dry_run: bool,
     conn=None,
+    boundary_oversample: int = 2,
 ) -> dict:
     """Process all charts and return summary counts.
 
@@ -417,6 +560,7 @@ def process_charts(
         overwrite: Overwrite existing tiles
         dry_run: Skip file writing
         conn: Optional psycopg2 connection for DB logging
+        boundary_oversample: Extra boundary tile copies (train only)
 
     Returns:
         Summary dict with train_tiles, val_tiles, errors
@@ -425,15 +569,20 @@ def process_charts(
     train_tiles = 0
     val_tiles = 0
     errors = 0
+    skipped_tiles = 0
 
     for chart in charts:
         chart_id = chart['chart_id']
         usage = 'val' if chart_id in val_id_set else 'train'
         start = time.time()
         try:
-            pairs = tile_chart(chart, usage, output_dir, tile_size, overlap, overwrite, dry_run)
+            pairs, skipped = tile_chart(
+                chart, usage, output_dir, tile_size, overlap,
+                overwrite, dry_run, boundary_oversample
+            )
             duration = time.time() - start
             n = len(pairs)
+            skipped_tiles += skipped
             if usage == 'train':
                 train_tiles += n
             else:
@@ -456,7 +605,7 @@ def process_charts(
                     conn, chart_id, 'create_tiles', 'error', str(exc), duration
                 )
 
-    return {'train_tiles': train_tiles, 'val_tiles': val_tiles, 'errors': errors}
+    return {'train_tiles': train_tiles, 'val_tiles': val_tiles, 'errors': errors, 'skipped_tiles': skipped_tiles}
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +620,14 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--all', action='store_true', help='Process all charts with masks')
     group.add_argument('--chart-id', type=int, help='Process a single chart by ID')
+    parser.add_argument(
+        '--mask-dir', type=Path, default=Config.OUTPUT_BASE,
+        help='Base output directory containing mask subdirs (default: /data/output)',
+    )
+    parser.add_argument(
+        '--boundary-oversample', type=int, default=2,
+        help='Extra copies of boundary tiles for training oversampling (default: 2)',
+    )
     parser.add_argument(
         '--output-dir', type=Path, default=Config.OUTPUT_TILES,
         help='Output base directory for tiles (default: /data/output/tiles)',
@@ -514,14 +671,14 @@ def main() -> None:
 
     try:
         if args.chart_id:
-            chart = get_single_chart(conn, args.chart_id, Config.OUTPUT_MASKS)
+            chart = get_single_chart(conn, args.chart_id, args.mask_dir)
             if not chart:
                 logger.error(f'Chart {args.chart_id} not found or has no mask')
                 sys.exit(1)
             charts = [chart]
             train_ids, val_ids = split_charts([args.chart_id], args.val_ratio, args.seed)
         else:
-            charts = get_charts_with_masks(conn, Config.OUTPUT_MASKS)
+            charts = get_charts_with_masks(conn, args.mask_dir)
             if not charts:
                 logger.warning('No charts with masks found')
                 sys.exit(0)
@@ -540,6 +697,7 @@ def main() -> None:
             overwrite=args.overwrite,
             dry_run=args.dry_run,
             conn=conn,
+            boundary_oversample=args.boundary_oversample,
         )
 
         logger.info('=' * 60)
@@ -551,6 +709,7 @@ def main() -> None:
         logger.info(
             f"Total tiles       : {summary['train_tiles'] + summary['val_tiles']}"
         )
+        logger.info(f"Skipped tiles     : {summary['skipped_tiles']}")
         logger.info(f"Errors            : {summary['errors']}")
         logger.info('=' * 60)
 
