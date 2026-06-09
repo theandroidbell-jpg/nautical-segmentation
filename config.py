@@ -89,8 +89,8 @@ class Config:
     TILE_SIZE: int = 256
     OVERLAP: int = 32
     BATCH_SIZE: int = 8
-    # 17 native classes: -1 and 0-20 (code -20 is skipped entirely)
-    NUM_CLASSES: int = 17
+    # 18 native classes: -1, 0-20, and 230 (code -20 is skipped entirely)
+    NUM_CLASSES: int = 18
     # 4 input channels: 3 RGB + 1 rasterised initial-shapefile classification
     IN_CHANNELS: int = 4
     LEARNING_RATE: float = 1e-4
@@ -145,6 +145,7 @@ class Config:
         18:  'UnWanted/Bad',
         19:  'UnSurveyed',
         20:  'Sea Areas',
+        230: 'BSH Exclude',
     }
 
     # Codes to skip entirely (not included in training or inference)
@@ -176,6 +177,7 @@ class Config:
         18: 14,  # UnWanted/Bad
         19: 15,  # UnSurveyed
         20: 16,  # Sea Areas
+        230: 17,  # BSH Exclude
     }
 
     # Class index  →  native code (reverse mapping)
@@ -211,6 +213,7 @@ class Config:
         16: 2,   # (reserved) → exclude
         18: 2,   # UnWanted/Bad → exclude
         19: 2,   # UnSurveyed → exclude
+        230: 2,  # BSH Exclude → exclude
     }
 
     # ============================================================
