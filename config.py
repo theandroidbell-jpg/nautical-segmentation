@@ -71,12 +71,14 @@ class Config:
     OUTPUT_INITIAL_MASKS: Path = OUTPUT_BASE / 'initial_masks'
     OUTPUT_CORRECTED_MASKS: Path = OUTPUT_BASE / 'corrected_masks'
     OUTPUT_DIFF_MASKS: Path = OUTPUT_BASE / 'diff_masks'
+    OUTPUT_EXTENTS_MASKS: Path = OUTPUT_BASE / 'extents_masks'
     OUTPUT_TRANSPARENT_SOURCE: Path = OUTPUT_BASE / 'transparent_source'
     OUTPUT_TRANSPARENT_3857: Path = OUTPUT_BASE / 'transparent_3857'
     OUTPUT_TRANSPARENT_3395: Path = OUTPUT_BASE / 'transparent_3395'
     OUTPUT_TILES: Path = OUTPUT_BASE / 'tiles'
     OUTPUT_PREDICTIONS: Path = OUTPUT_BASE / 'predictions'
     OUTPUT_VECTORS: Path = OUTPUT_BASE / 'vectors'
+    TILE_MIN_COVERAGE: float = 0.10  # Minimum fraction of tile area inside chart extents
 
     # Model storage
     MODELS_DIR: Path = Path(__file__).parent / 'models'
@@ -87,8 +89,8 @@ class Config:
     TILE_SIZE: int = 256
     OVERLAP: int = 32
     BATCH_SIZE: int = 8
-    # 17 native classes: -1 and 0-20 (code -20 is skipped entirely)
-    NUM_CLASSES: int = 17
+    # 18 native classes: -1, 0-20, and 230 (code -20 is skipped entirely)
+    NUM_CLASSES: int = 18
     # 4 input channels: 3 RGB + 1 rasterised initial-shapefile classification
     IN_CHANNELS: int = 4
     LEARNING_RATE: float = 1e-4
@@ -143,6 +145,7 @@ class Config:
         18:  'UnWanted/Bad',
         19:  'UnSurveyed',
         20:  'Sea Areas',
+        230: 'BSH Exclude',
     }
 
     # Codes to skip entirely (not included in training or inference)
@@ -174,6 +177,7 @@ class Config:
         18: 14,  # UnWanted/Bad
         19: 15,  # UnSurveyed
         20: 16,  # Sea Areas
+        230: 17,  # BSH Exclude
     }
 
     # Class index  →  native code (reverse mapping)
@@ -209,6 +213,7 @@ class Config:
         16: 2,   # (reserved) → exclude
         18: 2,   # UnWanted/Bad → exclude
         19: 2,   # UnSurveyed → exclude
+        230: 2,  # BSH Exclude → exclude
     }
 
     # ============================================================
@@ -333,6 +338,7 @@ class Config:
             cls.OUTPUT_INITIAL_MASKS,
             cls.OUTPUT_CORRECTED_MASKS,
             cls.OUTPUT_DIFF_MASKS,
+            cls.OUTPUT_EXTENTS_MASKS,
             cls.OUTPUT_TRANSPARENT_SOURCE,
             cls.OUTPUT_TRANSPARENT_3857,
             cls.OUTPUT_TRANSPARENT_3395,
