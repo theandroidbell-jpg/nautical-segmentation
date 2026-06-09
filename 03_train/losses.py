@@ -25,6 +25,9 @@ class DiceLoss(nn.Module):
 
     Operates on raw logits; softmax is applied internally.
     Particularly useful for handling class imbalance.
+
+    Nodata pixels (targets < 0) are masked out before computing Dice so
+    that boundary-padded tiles do not pollute the loss signal.
     """
 
     def __init__(self, num_classes: int = 3, smooth: float = 1.0):
@@ -46,15 +49,26 @@ class DiceLoss(nn.Module):
         Args:
             predictions: Raw logits, shape (B, C, H, W).
             targets: Integer class labels, shape (B, H, W).
+                     Pixels with value < 0 are treated as nodata and excluded.
 
         Returns:
             Scalar Dice loss (1 - mean Dice coefficient across classes).
         """
-        probs = F.softmax(predictions, dim=1)  # (B, C, H, W)
+        # Mask out nodata pixels (value < 0, e.g. 255 cast to int8 → -1)
+        valid = targets >= 0
+        if not valid.any():
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
 
-        # One-hot encode targets → (B, C, H, W) float
-        targets_one_hot = F.one_hot(targets, num_classes=self.num_classes)  # (B,H,W,C)
+        probs = F.softmax(predictions, dim=1)  # (B, C, H, W)
+        valid_expanded = valid.unsqueeze(1)     # (B, 1, H, W)
+        probs = probs * valid_expanded
+
+        # Safe one-hot encode — replace nodata with 0 to avoid index errors
+        safe_targets = targets.clone()
+        safe_targets[~valid] = 0
+        targets_one_hot = F.one_hot(safe_targets, num_classes=self.num_classes)  # (B,H,W,C)
         targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
+        targets_one_hot = targets_one_hot * valid_expanded
 
         # Flatten spatial dims
         probs_flat = probs.view(probs.size(0), probs.size(1), -1)          # (B, C, N)
@@ -94,7 +108,8 @@ class CombinedLoss(nn.Module):
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
         self.dice_loss = DiceLoss(num_classes=num_classes)
-        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+        # ignore_index=-100 keeps CE consistent with DiceLoss nodata masking
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-100)
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -215,7 +230,7 @@ class DifferenceWeightedLoss(nn.Module):
         Returns:
             Scalar loss value.
         """
-        # Dice component (global)
+        # Dice component (global, nodata-masked internally)
         dice = self.dice_loss(predictions, targets)
 
         # Per-pixel CrossEntropy
