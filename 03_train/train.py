@@ -32,6 +32,7 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
 )
 logger = logging.getLogger(__name__)
+LOG_EVERY_BATCHES = 200  # log progress every N batches within an epoch
 
 
 # ------------------------------------------------------------------------------
@@ -120,6 +121,8 @@ def train_epoch(
         optimizer.zero_grad()
         logits = model(images)
         loss = criterion(logits, masks)
+        if LOG_EVERY_BATCHES and (batch_idx % LOG_EVERY_BATCHES == 0):
+            logger.info(f"  Train batch {batch_idx}/{len(train_loader)} loss={loss.item():.4f}")
         loss.backward()
         optimizer.step()
 
@@ -134,6 +137,7 @@ def train_epoch(
             batch_iou = calculate_iou(preds, masks, num_classes=num_classes)
             for cls, val in batch_iou.items():
                 iou_accumulator[cls].append(val)
+
     avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
     pixel_acc = correct_pixels / total_pixels if total_pixels > 0 else 0.0
 
@@ -188,6 +192,8 @@ def validate_epoch(
 
             logits = model(images)
             loss = criterion(logits, masks)
+            if LOG_EVERY_BATCHES and (batch_idx % LOG_EVERY_BATCHES == 0):
+                logger.info(f"  Val batch {batch_idx}/{len(val_loader)} loss={loss.item():.4f}")
             total_loss += loss.item()
             n_batches += 1
 
@@ -198,6 +204,7 @@ def validate_epoch(
             batch_iou = calculate_iou(preds, masks, num_classes=num_classes)
             for cls, val in batch_iou.items():
                 iou_accumulator[cls].append(val)
+
     avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
     pixel_acc = correct_pixels / total_pixels if total_pixels > 0 else 0.0
 
@@ -342,8 +349,8 @@ def main():
                         help='Do not use pretrained MobileNetV2 encoder weights.')
     parser.add_argument('--num-classes',   type=int,   default=Config.NUM_CLASSES,
                         help='Number of segmentation classes.')
-    parser.add_argument('--loss',          type=str,   default='combined',
-                        choices=['combined', 'dice', 'ce'],
+    parser.add_argument('--loss',          type=str,   default='diff_weighted',
+                        choices=['combined', 'dice', 'ce', 'diff_weighted'],
                         help='Loss function type.')
     parser.add_argument('--class-weights', type=str,   default='1.0,5.6,3.9',
                         help='Comma-separated per-class loss weights for num-classes classes '
@@ -363,7 +370,7 @@ def main():
 
     # -- Pretty-print settings -------------------------------------------------
     logger.info('=' * 60)
-    logger.info('  Nautical Segmentation -- Training (Sprint 3)')
+    logger.info('  Nautical Segmentation -- Training')
     logger.info('=' * 60)
     logger.info('  device        : %s', args.device)
     logger.info('  epochs        : %d', args.epochs)
